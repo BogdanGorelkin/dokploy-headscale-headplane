@@ -1,0 +1,31 @@
+services:
+  headscale:
+    image: docker.io/headscale/headscale:0.29.5
+    command: serve
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /var/run/headscale
+    expose:
+      - "8080"
+    volumes:
+      - headscale_data:/var/lib/headscale
+      - ../files/etc/headscale/config.yaml:/etc/headscale/config.yaml:ro
+    labels:
+      - me.tale.headplane.target=headscale
+
+  headplane:
+    image: ghcr.io/tale/headplane:latest
+    restart: unless-stopped
+    depends_on:
+      - headscale
+    expose:
+      - "3000"
+    volumes:
+      - headplane_data:/var/lib/headplane
+      - ../files/etc/headplane/config.yaml:/etc/headplane/config.yaml:ro
+      - ../files/etc/headscale/config.yaml:/etc/headscale/config.yaml:ro
+
+volumes:
+  headscale_data:
+  headplane_data:

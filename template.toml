@@ -1,0 +1,93 @@
+# One Compose stack, two Dokploy managed domains.
+# Set base_domain to your actual registered DNS zone before deploying.
+[variables]
+base_domain = "example.com"
+headscale_domain = "headscale.${base_domain}"
+headplane_domain = "headplane.${base_domain}"
+magicdns_domain = "vpn.${base_domain}"
+cookie_secret = "${hash:32}"
+
+[[config.domains]]
+serviceName = "headscale"
+port = 8080
+host = "${headscale_domain}"
+
+[[config.domains]]
+serviceName = "headplane"
+port = 3000
+host = "${headplane_domain}"
+
+[config.env]
+HEADSCALE_DOMAIN = "${headscale_domain}"
+HEADPLANE_DOMAIN = "${headplane_domain}"
+HEADSCALE_URL = "https://${headscale_domain}"
+HEADPLANE_URL = "https://${headplane_domain}"
+MAGICDNS_DOMAIN = "${magicdns_domain}"
+
+[[config.mounts]]
+filePath = "/etc/headscale/config.yaml"
+content = """
+server_url: https://${headscale_domain}
+listen_addr: 0.0.0.0:8080
+metrics_listen_addr: 127.0.0.1:9090
+grpc_listen_addr: 127.0.0.1:50443
+grpc_allow_insecure: false
+noise:
+  private_key_path: /var/lib/headscale/noise_private.key
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+  allocation: sequential
+derp:
+  server:
+    enabled: false
+  urls:
+    - https://controlplane.tailscale.com/derpmap/default
+  paths: []
+  auto_update_enabled: true
+  update_frequency: 3h
+database:
+  type: sqlite
+  sqlite:
+    path: /var/lib/headscale/db.sqlite
+    write_ahead_log: true
+policy:
+  mode: database
+dns:
+  magic_dns: true
+  base_domain: ${magicdns_domain}
+  override_local_dns: true
+  nameservers:
+    global:
+      - 1.1.1.1
+      - 1.0.0.1
+    split: {}
+  search_domains: []
+  extra_records: []
+log:
+  level: info
+  format: text
+unix_socket: /var/run/headscale/headscale.sock
+unix_socket_permission: \"0770\"
+"""
+
+[[config.mounts]]
+filePath = "/etc/headplane/config.yaml"
+content = """
+server:
+  host: 0.0.0.0
+  port: 3000
+  base_url: https://${headplane_domain}
+  cookie_secret: \"${cookie_secret}\"
+  cookie_secure: true
+  data_path: /var/lib/headplane
+headscale:
+  url: http://headscale:8080
+  public_url: https://${headscale_domain}
+  config_path: /etc/headscale/config.yaml
+integration:
+  docker:
+    enabled: false
+  agent:
+    enabled: false
+"""
