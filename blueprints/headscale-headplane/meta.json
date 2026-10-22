@@ -1,0 +1,13 @@
+{
+  "id": "headscale-headplane",
+  "name": "Headscale + Headplane",
+  "version": "0.29.5",
+  "description": "Self-hosted Tailscale control server (Headscale) with the Headplane web UI for managing users, machines, pre-auth keys and ACLs.",
+  "logo": "logo.svg",
+  "links": {
+    "github": "https://github.com/juanfont/headscale",
+    "website": "https://headscale.net/",
+    "docs": "https://headplane.net/"
+  },
+  "tags": ["vpn", "networking", "tailscale", "wireguard", "self-hosted"]
+}

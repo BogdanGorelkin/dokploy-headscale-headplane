@@ -1,0 +1,4 @@
+node_modules/
+dist/
+.render/
+.upstream/

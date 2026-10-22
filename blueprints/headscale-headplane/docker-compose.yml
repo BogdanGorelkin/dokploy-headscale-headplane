@@ -1,0 +1,53 @@
+services:
+  headscale:
+    image: docker.io/headscale/headscale:0.29.5
+    command: serve
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /var/run/headscale
+    expose:
+      - "8080"
+    volumes:
+      - headscale-data:/var/lib/headscale
+      - ../files/etc/headscale/config.yaml:/etc/headscale/config.yaml:ro
+    healthcheck:
+      test: ["CMD", "headscale", "health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  headplane:
+    image: ghcr.io/tale/headplane:0.8.1
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp
+    depends_on:
+      headscale:
+        condition: service_healthy
+    expose:
+      - "3000"
+    volumes:
+      - headplane-data:/var/lib/headplane
+      - ../files/etc/headplane/config.yaml:/etc/headplane/config.yaml:ro
+      - ../files/etc/headscale/config.yaml:/etc/headscale/config.yaml:ro
+    healthcheck:
+      test: ["CMD", "/bin/hp_healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  headscale-data: {}
+  headplane-data: {}

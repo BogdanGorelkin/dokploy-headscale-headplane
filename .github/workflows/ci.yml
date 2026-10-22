@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, dev]
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: Dokploy/templates ref to validate against
+        default: e44418a2fc926db93a14335eb7ae9df527ac86aa
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Dokploy/templates commit whose validators the blueprint must pass.
+  UPSTREAM_REF: ${{ inputs.upstream_ref || 'e44418a2fc926db93a14335eb7ae9df527ac86aa' }}
+
+jobs:
+  static:
+    name: Static validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+
+      - name: Validate blueprint (YAML, TOML, meta, variables, placeholders, secrets)
+        run: node scripts/validate.mjs
+
+      - name: Validator rejects known-bad templates
+        run: node tests/validate-negative.mjs
+
+      - name: Lint shell scripts
+        run: shellcheck scripts/*.sh tests/*.sh
+
+      - name: Lint workflows
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
+
+      - name: Docker Compose syntax (rendered as Dokploy lays it out)
+        run: |
+          node scripts/render.mjs --out .render/ci --app-name ci --base-domain example.com
+          docker compose --project-directory .render/ci/code -f .render/ci/code/docker-compose.yml config --quiet
+
+      - name: Generate Dokploy Base64 import
+        run: node scripts/build-import.mjs --out dist/import-base64.txt
+
+      - name: Decode and parse the import artifact
+        run: node scripts/validate.mjs --import dist/import-base64.txt
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dokploy-import-base64
+          path: dist/import-base64.txt
+          if-no-files-found: error
+
+  upstream:
+    name: Official Dokploy/templates validators
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Dokploy/templates
+          ref: ${{ env.UPSTREAM_REF }}
+          path: .upstream
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - run: bash scripts/check-upstream.sh .upstream
+
+  images:
+    name: Image tags exist (amd64 + arm64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Inspect every image referenced by the compose file
+        run: |
+          images=$(grep -E '^\s+image:' blueprints/headscale-headplane/docker-compose.yml | awk '{print $2}')
+          for image in $images; do
+            echo "::group::$image"
+            platforms=$(docker buildx imagetools inspect "$image" --format '{{range .Manifest.Manifests}}{{.Platform.OS}}/{{.Platform.Architecture}} {{end}}')
+            echo "$platforms"
+            for p in linux/amd64 linux/arm64; do
+              grep -q "$p" <<<"$platforms" || { echo "::error::$image has no $p image"; exit 1; }
+            done
+            echo "::endgroup::"
+          done
+
+  secrets:
+    name: Secret scan (full history)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - run: docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.30.1 git /repo --redact --verbose
+
+  e2e:
+    name: End-to-end (Docker, no Dokploy)
+    runs-on: ubuntu-latest
+    needs: static
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Deploy, authenticate, manage, join nodes, upgrade, restart, back up and restore
+        run: bash tests/e2e-local.sh
