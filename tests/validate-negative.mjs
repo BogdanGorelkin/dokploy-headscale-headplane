@@ -31,6 +31,13 @@ const cases = [
 	["meta version mismatch", edit("meta.json", /"version": "[^"]+"/, '"version": "0.0.1"'), "must match the headscale image tag"],
 	["MagicDNS parent of server", edit("template.toml", 'magicdns_domain = "vpn.${base_domain}"', 'magicdns_domain = "${base_domain}"'), "parent domain"],
 	["invalid TOML", edit("template.toml", "[variables]", "[variables"), "invalid TOML"],
+	["admin helper reads the database", edit("docker-compose.yml", "      - headscale-socket:/var/run/headscale\n      - ../files/etc/headscale/config.yaml:/etc/headscale/config.yaml:ro\n    # \"healthy\"", "      - headscale-socket:/var/run/headscale\n      - headscale-data:/var/lib/headscale\n      - ../files/etc/headscale/config.yaml:/etc/headscale/config.yaml:ro\n    # \"healthy\""), "must not mount Headscale's data volume"],
+	["admin helper exposes a port", edit("docker-compose.yml", '    command: ["3600"]', '    command: ["3600"]\n    expose:\n      - "8080"'), "must not expose"],
+	["admin helper version drift", edit("docker-compose.yml", /headscale:[\d.]+-debug/, "headscale:0.29.4-debug"), "same version"],
+	["admin helper runs forever", edit("docker-compose.yml", 'restart: "no"', "restart: unless-stopped"), 'restart must be no'],
+	["socket persisted on disk", edit("docker-compose.yml", "      type: tmpfs\n", ""), "must be tmpfs-backed"],
+	["Headplane gets the admin socket", edit("docker-compose.yml", "      - headplane-data:/var/lib/headplane", "      - headplane-data:/var/lib/headplane\n      - headscale-socket:/var/run/headscale"), "must not mount the Headscale admin socket"],
+	["container not read-only", edit("docker-compose.yml", "    read_only: true\n    security_opt:\n      - no-new-privileges:true\n    cap_drop:\n      - ALL\n    tmpfs:\n      - /tmp\n    depends_on:\n      headscale:", "    security_opt:\n      - no-new-privileges:true\n    cap_drop:\n      - ALL\n    tmpfs:\n      - /tmp\n    depends_on:\n      headscale:"), "read_only: true is required"],
 ];
 
 let failed = 0;

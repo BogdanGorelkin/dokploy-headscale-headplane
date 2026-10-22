@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Static validation of the blueprint. No Docker or network access required.
 //
-//   node scripts/validate.mjs [--import <base64-file>] [--dir <blueprint-dir>]
+//   node scripts/validate.mjs [--import <base64-file> [--expect-base-domain <domain>]]
+//                             [--dir <blueprint-dir>]
 //
 // Checks Dokploy/templates conventions, Compose <-> template consistency,
 // variable resolution through Dokploy's own processing logic, the generated
@@ -28,6 +29,8 @@ const error = (msg) => errors.push(msg);
 const warn = (msg) => warnings.push(msg);
 
 const KNOWN_HELPERS = /^(domain|base64(:\d+)?|password(:\d+)?|hash(:\d+)?|uuid|randomPort|timestamp|timestampms|timestamps(:.+)?|timestampms:.+|jwt(:.+)?|username|email)$/;
+const ADMIN_SERVICE = "headscale-admin";
+const SOCKET_VOLUME = "headscale-socket";
 const SAMPLE = { appName: "validate-headscale-headplane-abc123", serverIp: "203.0.113.10" };
 
 function placeholders(text) {
@@ -89,8 +92,16 @@ for (const [name, svc] of Object.entries(services)) {
 	if (svc.networks) error(`${where}: explicit "networks" are not allowed`);
 	if (svc.privileged) error(`${where}: "privileged" is not allowed`);
 	if (svc.network_mode) error(`${where}: "network_mode" is not allowed`);
-	if (!["unless-stopped", "always"].includes(svc.restart)) error(`${where}: restart must be unless-stopped or always`);
+	// The admin helper is deliberately not restarted: it stops itself after its
+	// idle timeout and is started on demand from Dokploy's Containers tab.
+	const allowedRestart = name === ADMIN_SERVICE ? ["no"] : ["unless-stopped", "always"];
+	if (!allowedRestart.includes(String(svc.restart))) {
+		error(`${where}: restart must be ${allowedRestart.join(" or ")}`);
+	}
 	if (!svc.healthcheck) error(`${where}: healthcheck missing`);
+	if (svc.read_only !== true) error(`${where}: read_only: true is required`);
+	if (!(svc.cap_drop ?? []).includes("ALL")) error(`${where}: cap_drop: [ALL] is required`);
+	if (!(svc.security_opt ?? []).includes("no-new-privileges:true")) error(`${where}: no-new-privileges is required`);
 	if (!svc.image) error(`${where}: image missing`);
 
 	const image = String(svc.image ?? "");
@@ -121,6 +132,37 @@ for (const [name, svc] of Object.entries(services)) {
 for (const ref of placeholders(blueprint.compose)) {
 	error(`docker-compose.yml: \${${ref}} interpolation is not provided by the template env`);
 }
+// Admin helper: shares only Headscale's socket, never its database.
+const admin = services[ADMIN_SERVICE];
+if (!admin) {
+	error(`docker-compose.yml: service "${ADMIN_SERVICE}" (Dokploy terminal bootstrap helper) is missing`);
+} else {
+	const where = `docker-compose.yml: service "${ADMIN_SERVICE}"`;
+	const mounts = (admin.volumes ?? []).map((v) => (typeof v === "string" ? v : `${v.source}:${v.target}`));
+	if (imageTags[ADMIN_SERVICE] !== `${imageTags.headscale}-debug`) {
+		error(`${where}: image must be the Headscale debug image of the same version (${imageTags.headscale}-debug)`);
+	}
+	if (admin.expose || admin.ports) error(`${where}: must not expose or publish ports`);
+	if (mounts.some((m) => m.startsWith("headscale-data:") || m.includes("/var/lib/headscale"))) {
+		error(`${where}: must not mount Headscale's data volume (the CLI must go through the server)`);
+	}
+	if (!mounts.includes(`${SOCKET_VOLUME}:/var/run/headscale`)) error(`${where}: must mount ${SOCKET_VOLUME}:/var/run/headscale`);
+	if (admin.depends_on?.headscale?.condition !== "service_healthy") error(`${where}: must depend on a healthy headscale`);
+	if (admin.init !== true) error(`${where}: init: true is required so stop/start from Dokploy is immediate`);
+	const ttl = Number(Array.isArray(admin.command) ? admin.command[0] : admin.command);
+	if (!(String(admin.entrypoint) === "sleep" && ttl > 0 && ttl <= 4 * 3600)) {
+		error(`${where}: must idle with a bounded sleep (<= 4h) and print nothing`);
+	}
+}
+const socketVolume = compose?.volumes?.[SOCKET_VOLUME];
+if (socketVolume?.driver_opts?.type !== "tmpfs") error(`docker-compose.yml: volume ${SOCKET_VOLUME} must be tmpfs-backed`);
+for (const [name, svc] of Object.entries(services)) {
+	const usesSocket = (svc.volumes ?? []).some((v) => String(typeof v === "string" ? v : v.source).startsWith(`${SOCKET_VOLUME}:`) || v?.source === SOCKET_VOLUME);
+	if (usesSocket && !["headscale", ADMIN_SERVICE].includes(name)) {
+		error(`docker-compose.yml: service "${name}" must not mount the Headscale admin socket`);
+	}
+}
+
 if (meta.version && imageTags.headscale !== meta.version) {
 	error(`meta.json: version "${meta.version}" must match the headscale image tag "${imageTags.headscale}"`);
 }
@@ -247,10 +289,10 @@ if (template && compose) {
 	renderAndCheck("default (${domain})", blueprint.config);
 	const custom = applyVariableOverrides(blueprint.config, {
 		base_domain: "example.com",
-		headscale_host: "headscale-test.example.com",
+		headscale_host: "hs.example.com",
 	});
 	const hosts = renderAndCheck("custom domain", custom);
-	if (hosts && hosts.headscale !== "headscale-test.example.com") error("custom domain: host override not applied");
+	if (hosts && hosts.headscale !== "hs.example.com") error("custom domain: host override not applied");
 	if (hosts && hosts.headplane !== "headplane.example.com") error("custom domain: derived host not applied");
 }
 
@@ -293,7 +335,16 @@ if (args.import) {
 		const result = processImport(base64, SAMPLE);
 		if (result.template.domains.length !== config.domains.length) error(`${args.import}: domain count mismatch`);
 		if (result.template.mounts.length !== config.mounts.length) error(`${args.import}: mount count mismatch`);
-		console.log(`import artifact OK: ${relative(process.cwd(), args.import)}`);
+		const expected = args["expect-base-domain"];
+		if (expected) {
+			const hosts = Object.fromEntries(result.template.domains.map((d) => [d.serviceName, d.host]));
+			const want = { headscale: `headscale.${expected}`, headplane: `headplane.${expected}`, magicdns: `vpn.${expected}` };
+			const got = { ...hosts, magicdns: result.template.variables.magicdns_domain };
+			for (const [key, value] of Object.entries(want)) {
+				if (got[key] !== value) error(`${args.import}: ${key} host is "${got[key]}", expected "${value}"`);
+			}
+		}
+		console.log(`import artifact ${errors.length ? "FAILED" : "OK"}: ${relative(process.cwd(), args.import)}`);
 		for (const d of result.template.domains) console.log(`  domain  ${d.serviceName} -> ${d.host}:${d.port} https=${d.https}`);
 		for (const m of result.template.mounts) console.log(`  mount   ${m.filePath} (${m.content.length} bytes)`);
 		console.log(`  env     ${result.template.envs.length} variable(s)`);

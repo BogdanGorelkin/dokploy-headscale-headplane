@@ -2,13 +2,20 @@
 # End-to-end test of the template with plain Docker (no Dokploy, no Traefik).
 #
 # Renders the template the way Dokploy lays it out on disk, then:
-#   deploy (previous release) -> health -> API key -> Headplane login ->
-#   create user + reusable pre-auth key through Headplane -> join 2 Tailscale
-#   nodes -> upgrade to pinned images -> restart -> recreate -> backup ->
-#   wipe -> restore -> verify state and connectivity.
+#   1. deploys the PREVIOUS template version (no admin helper) on the previous
+#      image releases, creates an API key over "SSH" (scripts/create-api-key.sh),
+#      a user, a pre-auth key and two Tailscale nodes;
+#   2. upgrades in place to the current template and pinned images and checks
+#      that all state survives;
+#   3. bootstraps an API key through the headscale-admin helper exactly the way
+#      Dokploy's web terminal does (docker exec -w / <container> sh) and checks
+#      the helper's isolation, logs and idle-timeout behaviour;
+#   4. restarts, recreates, backs up, wipes (fresh install + helper bootstrap)
+#      and restores.
 #
-# Requirements: docker (with compose v2), node >= 20, internet access (images,
-# Tailscale DERP map). Usage: tests/e2e-local.sh   (KEEP=1 keeps the stack up)
+# Requirements: docker (compose v2), node >= 20, git history containing
+# PREV_TEMPLATE_REF, internet access. Usage: tests/e2e-local.sh  (KEEP=1 keeps
+# the stack running afterwards)
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -19,11 +26,15 @@ OUT="$RENDER_ROOT/$APP"
 NET="${APP}_default"
 CURL_IMAGE=curlimages/curl:8.17.0
 TS_IMAGE=tailscale/tailscale:v1.104.2
-# "Updating container images" is tested by first deploying these releases.
+HELPER_IMAGE=alpine:3.22.2
+# Last committed template without the admin helper, and the image releases
+# preceding the pinned ones: an existing deployment that gets upgraded.
+PREV_TEMPLATE_REF=${PREV_TEMPLATE_REF:-d437210}
 FROM_HEADSCALE=${FROM_HEADSCALE:-0.29.4}
 FROM_HEADPLANE=${FROM_HEADPLANE:-0.7.1}
 HP_HOST="headplane.$BASE_DOMAIN"
 BACKUP_DIR="$RENDER_ROOT/$APP-backup"
+COMPOSE_FILE="$OUT/code/docker-compose.yml"
 
 pass=0
 step() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
@@ -31,7 +42,7 @@ ok() { pass=$((pass + 1)); printf '  \033[32mPASS\033[0m %s\n' "$*"; }
 fail() { printf '  \033[31mFAIL\033[0m %s\n' "$*"; exit 1; }
 check() { local desc=$1; shift; if "$@"; then ok "$desc"; else fail "$desc"; fi; }
 
-compose() { docker compose --project-directory "$OUT/code" -f "$OUT/code/docker-compose.yml" -p "$APP" "$@"; }
+compose() { docker compose --project-directory "$OUT/code" -f "$COMPOSE_FILE" -p "$APP" "$@"; }
 hs() { compose exec -T headscale headscale "$@"; }
 curl_net() { docker run --rm --network "$NET" "$CURL_IMAGE" -sS "$@"; }
 hp_headers=(-H "Host: $HP_HOST" -H "X-Forwarded-Proto: https" -H "X-Forwarded-Host: $HP_HOST" -H "Origin: https://$HP_HOST")
@@ -40,20 +51,26 @@ ts_names=("$APP-ts-node1" "$APP-ts-node2")
 cleanup() {
 	if [[ "${KEEP:-0}" == "1" ]]; then
 		echo "KEEP=1: leaving stack '$APP' running"
-		return
+		return 0
 	fi
 	docker rm -f "${ts_names[@]}" >/dev/null 2>&1 || true
-	[[ -f "$OUT/code/docker-compose.yml" ]] && compose down -v --remove-orphans >/dev/null 2>&1 || true
-	rm -rf "$BACKUP_DIR"
+	# Compose can tear a project down by name alone, so cleanup also works
+	# when the rendered compose file is missing (e.g. rendering failed).
+	if [[ -f "$COMPOSE_FILE" ]]; then
+		compose down -v --remove-orphans >/dev/null 2>&1 || true
+	else
+		docker compose -p "$APP" down -v --remove-orphans >/dev/null 2>&1 || true
+	fi
+	rm -rf "${BACKUP_DIR:?}"
 }
 trap cleanup EXIT
 
 wait_healthy() {
-	compose up -d --wait --wait-timeout 180 >/dev/null 2>&1 || {
+	if ! compose up -d --wait --wait-timeout 180 >/dev/null 2>&1; then
 		compose ps
 		compose logs --no-color --tail 50
 		return 1
-	}
+	fi
 }
 
 http_code() { curl_net -o /dev/null -w '%{http_code}' "$@"; }
@@ -68,38 +85,6 @@ hp_post() {
 	curl_net -X POST "${hp_headers[@]}" -H "Cookie: $cookie" --data "$data" "http://headplane:3000$path"
 }
 
-user_id() { hs users list -o json-line | grep -o "\"id\":[0-9]*,\"name\":\"$1\"" | grep -o '[0-9]*' | head -1; }
-node_count() { hs nodes list -o json-line | grep -o '"given_name"' | wc -l | tr -d ' '; }
-noise_hash() { docker run --rm -v "${APP}_headscale-data:/d:ro" alpine:3.22.2 sha256sum /d/noise_private.key | cut -c1-64; }
-
-ts_running() {
-	docker exec "$1" tailscale status --json 2>/dev/null | grep -q '"BackendState": "Running"'
-}
-
-wait_ts() {
-	local i
-	for i in $(seq 1 45); do ts_running "$1" && return 0; sleep 2; done
-	docker logs --tail 20 "$1"
-	return 1
-}
-
-ts_ping() { docker exec "${ts_names[0]}" tailscale ping -c 5 --until-direct=false e2e-node2 >/dev/null 2>&1; }
-
-no_published_ports() { ! docker ps --filter "label=com.docker.compose.project=$APP" --format '{{.Ports}}' | grep -q -- '->'; }
-has_prefix() { [[ "$1" == "$2"* ]]; }
-running_pinned_images() {
-	local images
-	images=$(docker ps --filter "label=com.docker.compose.project=$APP" --format '{{.Image}}')
-	grep -q "${HS_IMAGE#docker.io/}\$" <<<"$images" && grep -q "${HP_IMAGE}\$" <<<"$images"
-}
-
-# shellcheck disable=SC2016 # a literal "${" is what we search for
-no_placeholders() { ! grep -R -F '${' "$OUT/files"; }
-metrics_unreachable() { ! curl_net -m 3 http://headscale:9090/metrics >/dev/null 2>&1; }
-magicdns_suffix_ok() {
-	docker exec "${ts_names[0]}" tailscale status --json | grep -q "\"MagicDNSSuffix\": \"vpn.$BASE_DOMAIN\""
-}
-
 check_pages() {
 	local page
 	for page in "$@"; do
@@ -108,48 +93,129 @@ check_pages() {
 	done
 }
 
+session_valid() { test "$(http_code "${hp_headers[@]}" -H "Cookie: $1" http://headplane:3000/admin/machines)" = 200; }
+
 # Allow-all policy written through Headplane's ACL editor.
 POLICY='{"acls":[{"action":"accept","src":["*"],"dst":["*:*"]}]}'
-jq_free_urlencode() { node -e 'process.stdout.write(encodeURIComponent(require("fs").readFileSync(0, "utf8")))'; }
+urlencode() { node -e 'process.stdout.write(encodeURIComponent(require("fs").readFileSync(0, "utf8")))'; }
 policy_saved() { hs policy get 2>/dev/null | grep -q '"accept"'; }
 
+user_id() { hs users list -o json-line | grep -o "\"id\":[0-9]*,\"name\":\"$1\"" | grep -o '[0-9]*' | head -1; }
+node_count() { hs nodes list -o json-line | grep -o '"given_name"' | wc -l | tr -d ' '; }
+noise_hash() { docker run --rm -v "${APP}_headscale-data:/d:ro" "$HELPER_IMAGE" sha256sum /d/noise_private.key | cut -c1-64; }
 state_snapshot() { echo "users=$(hs users list -o json-line | grep -o '"name":"[^"]*"' | sort | tr '\n' ' ') nodes=$(node_count) noise=$(noise_hash)"; }
 
+ts_running() { docker exec "$1" tailscale status --json 2>/dev/null | grep -q '"BackendState": "Running"'; }
+wait_ts() {
+	local i
+	for i in $(seq 1 45); do ts_running "$1" && return 0; sleep 2; done
+	docker logs --tail 20 "$1"
+	return 1
+}
+ts_ping() { docker exec "${ts_names[0]}" tailscale ping -c 5 --until-direct=false e2e-node2 >/dev/null 2>&1; }
+magicdns_suffix_ok() {
+	docker exec "${ts_names[0]}" tailscale status --json | grep -q "\"MagicDNSSuffix\": \"vpn.$BASE_DOMAIN\""
+}
+
+# shellcheck disable=SC2016 # a literal "${" is what we search for
+no_placeholders() { ! grep -R -F '${' "$OUT/files"; }
+metrics_unreachable() { ! curl_net -m 3 http://headscale:9090/metrics >/dev/null 2>&1; }
+no_published_ports() { ! docker ps -a --filter "label=com.docker.compose.project=$APP" --format '{{.Ports}}' | grep -q -- '->'; }
+has_prefix() { [[ "$1" == "$2"* ]]; }
+running_pinned_images() {
+	local images
+	images=$(docker ps --filter "label=com.docker.compose.project=$APP" --format '{{.Image}}')
+	grep -q "${HS_IMAGE#docker.io/}\$" <<<"$images" && grep -q "${HP_IMAGE}\$" <<<"$images"
+}
+
+# -- headscale-admin helper -----------------------------------------------------
+admin_id() { compose ps -a -q headscale-admin; }
+
+# Exactly what Dokploy's terminal runs: docker exec -it -w / <container> <shell>,
+# with the command typed into the shell.
+terminal() {
+	local shell=$1
+	shift
+	# Callers judge the transcript, not the exit status (a missing shell is
+	# itself an expected outcome for the "bash" tab).
+	printf '%s\nexit\n' "$*" | docker exec -i -w / "$(admin_id)" "$shell" 2>&1 || true
+}
+
+terminal_api_key() { terminal sh "headscale apikeys create --expiration 1d" | grep -o 'hskey-api-[A-Za-z0-9_-]*' | head -1; }
+
+key_absent_from_logs() {
+	local id
+	for id in $(docker ps -a -q --filter "label=com.docker.compose.project=$APP"); do
+		if docker logs "$id" 2>&1 | grep -q -F "$1"; then
+			echo "    key found in logs of $(docker inspect -f '{{.Name}}' "$id")"
+			return 1
+		fi
+	done
+}
+
+admin_has_no_data_access() {
+	! docker inspect "$(admin_id)" --format '{{range .Mounts}}{{.Destination}} {{end}}' | grep -q '/var/lib/headscale' &&
+		terminal sh "ls /var/lib/headscale" | grep -q 'No such file'
+}
+admin_rootfs_readonly() { terminal sh "touch /probe" | grep -q 'Read-only file system'; }
+admin_only_project_network() {
+	test "$(docker inspect "$(admin_id)" --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}')" = "$NET "
+}
+socket_on_tmpfs() { terminal sh "grep ' /var/run/headscale ' /proc/mounts" | grep -q '^tmpfs '; }
+headplane_has_no_socket() {
+	! docker inspect "$(compose ps -q headplane)" --format '{{range .Mounts}}{{.Destination}} {{end}}' | grep -q '/var/run/headscale'
+}
+bash_tab_unavailable() { terminal bash "true" | grep -q 'executable file not found'; }
+no_admin_service() { ! grep -q headscale-admin "$COMPOSE_FILE"; }
+server_lists_key() { hs apikeys list | grep -q -F "${1:0:22}"; }
+admin_state() { docker inspect "$(admin_id)" --format '{{.State.Status}} {{.State.ExitCode}}'; }
+wait_admin_exited() {
+	local i
+	for i in $(seq 1 30); do
+		[[ "$(admin_state)" == "exited 0" ]] && return 0
+		sleep 1
+	done
+	return 1
+}
+admin_logs_empty() { test -z "$(docker logs "$(admin_id)" 2>&1)"; }
+exited_admin_has_no_shell() { ! docker exec "$(admin_id)" true >/dev/null 2>&1; }
+admin_start_works() {
+	docker start "$(admin_id)" >/dev/null
+	[[ "$(admin_state)" == "running 0" ]] && has_prefix "$(terminal_api_key)" hskey-api-
+}
+
 # ---------------------------------------------------------------------------
-step "Render template (Dokploy import path) for https://*.$BASE_DOMAIN"
+step "Render the current template (Dokploy import path) for https://*.$BASE_DOMAIN"
 cleanup
 node "$ROOT/scripts/render.mjs" --out "$OUT" --app-name "$APP" --base-domain "$BASE_DOMAIN"
 check "rendered compose, .env and mount files exist" \
-	test -f "$OUT/code/docker-compose.yml" -a -f "$OUT/code/.env" \
+	test -f "$COMPOSE_FILE" -a -f "$OUT/code/.env" \
 	-a -f "$OUT/files/etc/headscale/config.yaml" -a -f "$OUT/files/etc/headplane/config.yaml"
-check "no unresolved \${...} placeholders in mount files" \
-	no_placeholders
+check "no unresolved \${...} placeholders in mount files" no_placeholders
 check "docker compose config is valid" compose config --quiet
 
-pinned_compose=$(cat "$OUT/code/docker-compose.yml")
-HS_IMAGE=$(grep -o 'docker.io/headscale/headscale:[^ ]*' <<<"$pinned_compose")
-HP_IMAGE=$(grep -o 'ghcr.io/tale/headplane:[^ ]*' <<<"$pinned_compose")
-sed -e "s|$HS_IMAGE|${HS_IMAGE%:*}:$FROM_HEADSCALE|" \
-	-e "s|$HP_IMAGE|${HP_IMAGE%:*}:$FROM_HEADPLANE|" \
-	"$OUT/code/docker-compose.yml" >"$OUT/code/docker-compose.yml.tmp"
-mv "$OUT/code/docker-compose.yml.tmp" "$OUT/code/docker-compose.yml"
-
+current_compose=$(cat "$COMPOSE_FILE")
+HS_IMAGE=$(grep -o 'docker.io/headscale/headscale:[0-9.]*' <<<"$current_compose" | head -1)
+HP_IMAGE=$(grep -o 'ghcr.io/tale/headplane:[^ ]*' <<<"$current_compose")
 check "headscale configtest accepts generated config" \
 	docker run --rm -v "$OUT/files/etc/headscale/config.yaml:/etc/headscale/config.yaml:ro" "$HS_IMAGE" configtest
 
-step "Fresh deployment (previous release: headscale $FROM_HEADSCALE, headplane $FROM_HEADPLANE)"
+step "Existing deployment: template $PREV_TEMPLATE_REF on headscale $FROM_HEADSCALE / headplane $FROM_HEADPLANE"
+git -C "$ROOT" show "$PREV_TEMPLATE_REF:blueprints/headscale-headplane/docker-compose.yml" |
+	sed -e "s|${HS_IMAGE}|${HS_IMAGE%:*}:$FROM_HEADSCALE|" -e "s|${HP_IMAGE}|${HP_IMAGE%:*}:$FROM_HEADPLANE|" \
+		>"$COMPOSE_FILE"
+check "previous template has no admin helper" no_admin_service
 check "both services start and become healthy" wait_healthy
 
 step "Endpoints and authentication"
 check "headscale /health returns 200" test "$(http_code http://headscale:8080/health)" = 200
 check "headplane /admin/login returns 200" test "$(http_code http://headplane:3000/admin/login)" = 200
 check "unauthenticated /admin/machines redirects (302)" test "$(http_code http://headplane:3000/admin/machines)" = 302
-check "metrics port 9090 is not reachable from the network" \
-	metrics_unreachable
+check "metrics port 9090 is not reachable from the network" metrics_unreachable
 check "no host ports are published" no_published_ports
 
 API_KEY=$(bash "$ROOT/scripts/create-api-key.sh" "$APP" 1d 2>/dev/null)
-check "scripts/create-api-key.sh returns an API key" has_prefix "$API_KEY" hskey-api-
+check "SSH fallback scripts/create-api-key.sh returns an API key" has_prefix "$API_KEY" hskey-api-
 check "a wrong API key does not create a session" test -z "$(hp_login not-a-valid-api-key)"
 COOKIE=$(hp_login "$API_KEY")
 check "Headplane login with the API key sets a session cookie" test -n "$COOKIE"
@@ -176,31 +242,62 @@ done
 check "node 1 is connected" wait_ts "${ts_names[0]}"
 check "node 2 is connected" wait_ts "${ts_names[1]}"
 check "Headscale lists 2 nodes" test "$(node_count)" = 2
-check "MagicDNS suffix is vpn.$BASE_DOMAIN" \
-	magicdns_suffix_ok
+check "MagicDNS suffix is vpn.$BASE_DOMAIN" magicdns_suffix_ok
 check "node 1 can tailscale-ping node 2" ts_ping
 BEFORE=$(state_snapshot)
 echo "  state: $BEFORE"
 
-step "Update container images to the pinned release"
-printf '%s\n' "$pinned_compose" >"$OUT/code/docker-compose.yml"
-check "stack recreated on ${HS_IMAGE##*/} / ${HP_IMAGE##*/} and healthy" wait_healthy
+step "Upgrade in place to the current template and pinned images"
+printf '%s\n' "$current_compose" >"$COMPOSE_FILE"
+check "stack recreated on ${HS_IMAGE##*/} / ${HP_IMAGE##*/} with headscale-admin, all healthy" wait_healthy
 check "running images are the pinned ones" running_pinned_images
 check "users, nodes and Noise key preserved across the upgrade" test "$(state_snapshot)" = "$BEFORE"
-check "existing Headplane session still valid after upgrade" \
-	test "$(http_code "${hp_headers[@]}" -H "Cookie: $COOKIE" http://headplane:3000/admin/machines)" = 200
+check "existing Headplane session still valid after upgrade" session_valid "$COOKIE"
 check "nodes reconnect after upgrade" wait_ts "${ts_names[0]}"
 check_pages machines users acls dns settings settings/auth-keys
-hp_post "$COOKIE" /admin/acls "policy=$(printf '%s' "$POLICY" | jq_free_urlencode)" >/dev/null
+hp_post "$COOKIE" /admin/acls "policy=$(printf '%s' "$POLICY" | urlencode)" >/dev/null
 check "Headplane saved an ACL policy to the Headscale database" policy_saved
 check "nodes still connected under the saved policy" ts_ping
 
-step "Restart both containers"
+step "Bootstrap through the headscale-admin helper (Dokploy Terminal, /bin/sh tab)"
+check "Dokploy's 'Bash' tab is unavailable (no bash in the image)" bash_tab_unavailable
+ADMIN_KEY=$(terminal_api_key)
+check "'headscale apikeys create' in the helper's sh returns an API key" has_prefix "$ADMIN_KEY" hskey-api-
+check "the key was created by the server (listed by the production container)" server_lists_key "$ADMIN_KEY"
+ADMIN_COOKIE=$(hp_login "$ADMIN_KEY")
+check "Headplane login works with the helper-created key" session_valid "$ADMIN_COOKIE"
+check "the key appears in no container's logs" key_absent_from_logs "$ADMIN_KEY"
+check "helper does not mount Headscale's data volume" admin_has_no_data_access
+check "helper root filesystem is read-only" admin_rootfs_readonly
+check "helper is attached only to the project network" admin_only_project_network
+check "admin socket lives on tmpfs" socket_on_tmpfs
+check "Headplane cannot reach the admin socket" headplane_has_no_socket
+check "still no host ports published (helper included)" no_published_ports
+compose restart headscale >/dev/null 2>&1
+wait_healthy
+check "helper reconnects after Headscale restarts (stale socket replaced)" \
+	has_prefix "$(terminal_api_key)" hskey-api-
+
+step "Helper idle timeout and Start from Dokploy's Containers tab"
+cat >"$OUT/code/short-ttl.yml" <<'EOF'
+services:
+  headscale-admin:
+    command: ["5"]
+EOF
+docker compose --project-directory "$OUT/code" -f "$COMPOSE_FILE" -f "$OUT/code/short-ttl.yml" -p "$APP" \
+	up -d headscale-admin >/dev/null 2>&1
+check "helper exits cleanly (code 0) when its idle timeout ends" wait_admin_exited
+check "an exited helper offers no shell (no standing admin access)" exited_admin_has_no_shell
+check "helper wrote nothing to its logs" admin_logs_empty
+check "Start (Containers tab) brings it back and a key can be created" admin_start_works
+rm -f "$OUT/code/short-ttl.yml"
+check "redeploy restores the normal helper" wait_healthy
+
+step "Restart all containers"
 compose restart >/dev/null 2>&1
 check "healthy after restart" wait_healthy
 check "state preserved across restart" test "$(state_snapshot)" = "$BEFORE"
-check "existing Headplane session still valid after restart" \
-	test "$(http_code "${hp_headers[@]}" -H "Cookie: $COOKIE" http://headplane:3000/admin/machines)" = 200
+check "existing Headplane session still valid after restart" session_valid "$COOKIE"
 
 step "Recreate containers (down without -v, then up)"
 compose down >/dev/null 2>&1
@@ -209,20 +306,27 @@ check "state preserved across recreate" test "$(state_snapshot)" = "$BEFORE"
 check "nodes reconnect after recreate" wait_ts "${ts_names[0]}"
 check "node 1 can still ping node 2" ts_ping
 
-step "Backup, wipe and restore"
+step "Backup"
 DOKPLOY_COMPOSE_DIR="$RENDER_ROOT" bash "$ROOT/scripts/backup.sh" "$APP" "$BACKUP_DIR" >/dev/null
 check "backup archives and manifest written" \
 	test -s "$BACKUP_DIR/headscale-data.tar.gz" -a -s "$BACKUP_DIR/headplane-data.tar.gz" \
 	-a -s "$BACKUP_DIR/files.tar.gz" -a -s "$BACKUP_DIR/MANIFEST"
 check "containers running again after backup" wait_healthy
-compose down -v >/dev/null 2>&1
-wait_healthy
-check "wiped deployment starts empty (0 nodes)" test "$(node_count)" = 0
+
+step "Fresh installation (all containers, networks and volumes removed)"
+compose down -v --remove-orphans >/dev/null 2>&1
+check "no project volumes remain" test -z "$(docker volume ls -q --filter "label=com.docker.compose.project=$APP")"
+check "fresh deployment becomes healthy" wait_healthy
+check "fresh deployment is empty (0 nodes)" test "$(node_count)" = 0
+FRESH_KEY=$(terminal_api_key)
+check "first API key bootstrapped through the helper" has_prefix "$FRESH_KEY" hskey-api-
+check "first Headplane login on the fresh install" session_valid "$(hp_login "$FRESH_KEY")"
+
+step "Restore"
 bash "$ROOT/scripts/restore.sh" "$APP" "$BACKUP_DIR" --yes >/dev/null
 check "healthy after restore" wait_healthy
 check "users, nodes and Noise key restored" test "$(state_snapshot)" = "$BEFORE"
-check "Headplane session restored" \
-	test "$(http_code "${hp_headers[@]}" -H "Cookie: $COOKIE" http://headplane:3000/admin/machines)" = 200
+check "Headplane session restored" session_valid "$COOKIE"
 check "nodes reconnect after restore" wait_ts "${ts_names[1]}"
 check "node 1 can ping node 2 after restore" ts_ping
 

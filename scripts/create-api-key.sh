@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Creates a Headscale API key for signing in to Headplane.
+# SSH fallback: creates a Headscale API key for signing in to Headplane.
 #
-# Run on the Docker host of the Dokploy deployment (e.g. over SSH). The
-# Headscale image is distroless, so Dokploy's web terminal cannot run this.
+# Normally you don't need this: open Dokploy -> Containers -> headscale-admin ->
+# Terminal (/bin/sh) and run `headscale apikeys create`. Use this script on the
+# Docker host when that terminal is unavailable.
 #
 #   scripts/create-api-key.sh                 # list Headscale deployments
 #   scripts/create-api-key.sh <app-name> [expiration]
