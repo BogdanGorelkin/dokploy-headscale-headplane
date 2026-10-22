@@ -18,26 +18,41 @@ const edit = (file, from, to) => (dir) => {
 };
 
 const cases = [
+	// Dokploy/templates conventions
 	["floating image tag", edit("docker-compose.yml", /headplane:[\w.-]+/, "headplane:latest"), "floating tag"],
 	["published host port", edit("docker-compose.yml", 'expose:\n      - "3000"', 'ports:\n      - "3000:3000"'), '"ports" is not allowed'],
 	["docker socket", edit("docker-compose.yml", "- headplane-data:/var/lib/headplane", "- /var/run/docker.sock:/var/run/docker.sock"), "Docker socket"],
+	["container not read-only", edit("docker-compose.yml", "    read_only: true\n", ""), "read_only: true is required"],
+	["meta version mismatch", edit("meta.json", /"version": "[^"]+"/, '"version": "0.0.1"'), "must match the headscale image tag"],
+	["invalid TOML", edit("template.toml", "[variables]", "[variables"), "invalid TOML"],
+	// Variables, domains, Environment
 	["undefined variable", edit("template.toml", 'host = "${headplane_host}"', 'host = "${headplane_hots}"'), "not defined in [variables]"],
 	["unknown domain service", edit("template.toml", 'serviceName = "headplane"', 'serviceName = "headplain"'), "not in compose"],
-	["domain without https", edit("template.toml", 'port = 3000\nhost = "${headplane_host}"\nhttps = true', 'port = 3000\nhost = "${headplane_host}"'), "https = true"],
-	["missing mount", edit("template.toml", 'filePath = "/etc/headplane/config.yaml"', 'filePath = "/etc/headplane/other.yaml"'), "has no [[config.mounts]] entry"],
+	["domain without https", edit("template.toml", 'path = "/admin/"\nhttps = true', 'path = "/admin/"'), "https = true"],
+	["headplane domain routes every path", edit("template.toml", 'path = "/admin/"\n', ""), 'must route only path "/admin/"'],
 	["hardcoded base domain", edit("template.toml", 'base_domain = "${domain}"', 'base_domain = "example.com"'), "must stay"],
-	["committed cookie secret", edit("template.toml", '"${headplane_cookie_secret}"', '"0123456789abcdef0123456789abcdef"'), "generated per import"],
-	["short cookie secret", edit("template.toml", '"${hash:32}"', '"${hash:16}"'), "32 character"],
-	["meta version mismatch", edit("meta.json", /"version": "[^"]+"/, '"version": "0.0.1"'), "must match the headscale image tag"],
+	// Built at runtime so no secret-shaped literal is committed (gitleaks).
+	["committed cookie secret", edit("template.toml", "HEADPLANE_COOKIE_SECRET=${headplane_cookie_secret}", `HEADPLANE_COOKIE_SECRET=${"0123456789abcdef".repeat(2)}`), "generated per import"],
+	["short cookie secret", edit("template.toml", '"${hash:32}"', '"${hash:16}"'), "32 letters or digits"],
 	["MagicDNS parent of server", edit("template.toml", 'magicdns_domain = "vpn.${base_domain}"', 'magicdns_domain = "${base_domain}"'), "parent domain"],
-	["invalid TOML", edit("template.toml", "[variables]", "[variables"), "invalid TOML"],
-	["admin helper reads the database", edit("docker-compose.yml", "      - headscale-socket:/var/run/headscale\n      - ../files/etc/headscale/config.yaml:/etc/headscale/config.yaml:ro\n    # \"healthy\"", "      - headscale-socket:/var/run/headscale\n      - headscale-data:/var/lib/headscale\n      - ../files/etc/headscale/config.yaml:/etc/headscale/config.yaml:ro\n    # \"healthy\""), "must not mount Headscale's data volume"],
+	["env value missing", edit("template.toml", '  "MAGICDNS_DOMAIN=${magicdns_domain}",\n', ""), "env must define MAGICDNS_DOMAIN"],
+	["compose uses an undeclared variable", edit("docker-compose.yml", "${APP_NAME}-headplane-root.tls=true", "${APP_NAME}-headplane-root.tls=${ENABLE_TLS}"), "is not provided by the template env"],
+	// Config renderer and templates
+	["template mount missing", edit("template.toml", 'filePath = "/templates/headplane.yaml"', 'filePath = "/templates/other.yaml"'), "mounts are required"],
+	["unknown template placeholder", edit("template.toml", "log:\n  level: info", "log:\n  level: {{LOG_LEVEL}}"), "doesn't fill in"],
+	["renderer skips validation", edit("docker-compose.yml", /\n +check MAGICDNS_DOMAIN [^\n]+/, ""), "does not validate MAGICDNS_DOMAIN"],
+	["services not restarted on Environment changes", edit("docker-compose.yml", "        restart: true\n", ""), "restart: true"],
+	// Traefik routing labels
+	["ACL editor's PATCH blocked", edit("docker-compose.yml", " && !Method(`PATCH`)", ""), "must allow PATCH"],
+	["hardcoded host in a Traefik label", edit("docker-compose.yml", "Host(`${HEADPLANE_HOST}`)", "Host(`headplane.example.com`)"), "must use Host"],
+	["label targets a Dokploy-generated router", edit("docker-compose.yml", "${APP_NAME}-headplane-root.service=noop@internal", "${APP_NAME}-1-websecure.service=noop@internal"), "Dokploy-generated router"],
+	// Admin helper
+	["admin helper reads the database", edit("docker-compose.yml", "      - headscale-socket:/var/run/headscale\n      - headscale-config:/etc/headscale:ro\n    # \"healthy\"", "      - headscale-socket:/var/run/headscale\n      - headscale-data:/var/lib/headscale\n      - headscale-config:/etc/headscale:ro\n    # \"healthy\""), "must not mount Headscale's data volume"],
 	["admin helper exposes a port", edit("docker-compose.yml", '    command: ["3600"]', '    command: ["3600"]\n    expose:\n      - "8080"'), "must not expose"],
-	["admin helper version drift", edit("docker-compose.yml", /headscale:[\d.]+-debug/, "headscale:0.29.4-debug"), "same version"],
-	["admin helper runs forever", edit("docker-compose.yml", 'restart: "no"', "restart: unless-stopped"), 'restart must be no'],
+	["admin helper version drift", edit("docker-compose.yml", /headscale:[\d.]+-debug(\n {4}entrypoint: \["sleep"\])/, "headscale:0.0.1-debug$1"), "same version"],
+	["admin helper runs forever", edit("docker-compose.yml", 'restart: "no"\n    init: true', "restart: unless-stopped\n    init: true"), "restart must be no"],
 	["socket persisted on disk", edit("docker-compose.yml", "      type: tmpfs\n", ""), "must be tmpfs-backed"],
 	["Headplane gets the admin socket", edit("docker-compose.yml", "      - headplane-data:/var/lib/headplane", "      - headplane-data:/var/lib/headplane\n      - headscale-socket:/var/run/headscale"), "must not mount the Headscale admin socket"],
-	["container not read-only", edit("docker-compose.yml", "    read_only: true\n    security_opt:\n      - no-new-privileges:true\n    cap_drop:\n      - ALL\n    tmpfs:\n      - /tmp\n    depends_on:\n      headscale:", "    security_opt:\n      - no-new-privileges:true\n    cap_drop:\n      - ALL\n    tmpfs:\n      - /tmp\n    depends_on:\n      headscale:"), "read_only: true is required"],
 ];
 
 let failed = 0;

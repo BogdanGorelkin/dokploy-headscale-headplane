@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,6 +17,15 @@ export function loadBlueprint(dir = BLUEPRINT_DIR) {
 		config: read("template.toml"),
 		meta: existsSync(metaPath) ? JSON.parse(read("meta.json")) : null,
 	};
+}
+
+// The blueprint as committed at a git ref (for upgrade tests).
+export function loadBlueprintAtRef(ref) {
+	const show = (name) =>
+		execFileSync("git", ["-C", REPO_ROOT, "show", `${ref}:blueprints/${BLUEPRINT_ID}/${name}`], {
+			encoding: "utf8",
+		});
+	return { dir: null, compose: show("docker-compose.yml"), config: show("template.toml"), meta: JSON.parse(show("meta.json")) };
 }
 
 // CLI flag -> template variable. Values are written verbatim into the TOML

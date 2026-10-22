@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026-present Dokploy Technology, Inc. (original code)
+// Modifications for this repository: ported to plain JavaScript, faker-based
+// username/email generation replaced by a simple random name.
+//
 // Faithful port of Dokploy's template processing, so that local validation,
 // rendering and the Base64 import behave exactly like a real Dokploy server.
 //

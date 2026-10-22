@@ -2,496 +2,437 @@
 
 A [Dokploy](https://dokploy.com) template that deploys a self-hosted
 [Tailscale](https://tailscale.com) control server, [Headscale](https://headscale.net),
-together with its web administration UI, [Headplane](https://headplane.net), as one
-Docker Compose service.
+together with its web UI, [Headplane](https://headplane.net), as one Compose service.
 
 | Component | Version | Image |
 | --- | --- | --- |
 | Headscale | 0.29.5 | `docker.io/headscale/headscale:0.29.5` |
 | Headplane | 0.8.1 | `ghcr.io/tale/headplane:0.8.1` |
-| Admin helper (optional shell) | 0.29.5 | `docker.io/headscale/headscale:0.29.5-debug` |
-| Dokploy | v0.30.x (import format verified against v0.30.8 source) | — |
+| Config renderer and admin shell | 0.29.5 | `docker.io/headscale/headscale:0.29.5-debug` |
+| Dokploy | v0.30.x (verified against the v0.30.8 source) | Traefik 3.6.25 |
 
 After a deployment you have:
 
-- `https://headscale.<your-domain>` — the control server your Tailscale clients log in to
-- `https://headplane.<your-domain>/admin` — the web UI for users, machines, pre-auth keys and ACLs
-- `*.vpn.<your-domain>` — MagicDNS names for your machines (resolved inside the tailnet, no DNS record needed)
+- `https://headscale.<your-domain>`: the control server your Tailscale clients log in to
+- `https://headplane.<your-domain>/admin/`: the web UI for users, machines, pre-auth keys and ACLs
+- `*.vpn.<your-domain>`: MagicDNS names, resolved inside the tailnet (no DNS record needed)
 
-> **Status:** Every step a script can test has been verified against real
-> containers: deployment, login, managing users and keys through Headplane,
-> Tailscale nodes joining, upgrades, restarts, and backup/restore (see
-> [Testing](#testing)). The previous template version has been deployed on a
-> live Dokploy instance with working HTTPS. Bootstrapping the first API key
-> from Dokploy's web terminal works locally against the exact `docker exec`
-> command Dokploy runs, but **has not yet been demonstrated in a real Dokploy
-> UI**; until it has, keep the [SSH fallback](#ssh-fallback) at hand.
+## Status
+
+| | Feature |
+| --- | --- |
+| **Validated on a live Dokploy** (template `5bca341`) | Base64 import, both services healthy, Let's Encrypt HTTPS, first API key created in Dokploy's web terminal (no SSH), Headplane login, client registration |
+| **Tested automatically, not yet on a live Dokploy** | Everything new in this version: installation from the Templates catalog, Environment-driven configuration, `/` → `/admin/` redirect and 404/405 filtering in Traefik, Isolated Deployment, upgrading an existing deployment by re-import, migrating a Headscale-only installation |
+| Automated test coverage | Real containers behind Dokploy's Traefik version and labels, shared and isolated networks, real Tailscale clients over HTTPS: **62 routing checks × 2 network modes, 95 end-to-end checks**, plus static and upstream validation (see [Testing](#testing)) |
 
 ## Contents
 
-- [Architecture](#architecture)
-- [Prerequisites](#prerequisites)
 - [Quick start](#quick-start)
-- [DNS setup](#dns-setup)
-- [HTTPS certificates](#https-certificates)
-- [Configuration and environment variables](#configuration-and-environment-variables)
-- [First login to Headplane](#first-login-to-headplane)
+- [Architecture](#architecture)
+- [Configuration](#configuration)
+- [DNS](#dns)
+- [HTTPS](#https)
+- [First login without SSH](#first-login-without-ssh)
+- [How Headplane is routed](#how-headplane-is-routed)
 - [Connecting Tailscale clients](#connecting-tailscale-clients)
-- [Reusable pre-authentication keys](#reusable-pre-authentication-keys)
-- [Security considerations](#security-considerations)
+- [Pre-authentication keys](#pre-authentication-keys)
+- [Security](#security)
 - [Backup and restore](#backup-and-restore)
 - [Upgrading](#upgrading)
 - [Troubleshooting](#troubleshooting)
 - [Differences from the upstream Docker examples](#differences-from-the-upstream-docker-examples)
 - [Testing](#testing)
-- [Contributing](#contributing)
-
-## Architecture
-
-```
-                         ┌──────────────── Dokploy host ────────────────────────────┐
- Tailscale clients ─443─▶│ Traefik ──▶ headscale:8080 ◀─── HTTP (Compose network) ─┐ │
-                         │   │          /var/lib/headscale  (volume headscale-data) │ │
-                         │   │          /var/run/headscale  (tmpfs volume headscale-socket)
-                         │   │                 ▲ Unix socket (gRPC)                 │ │
-                         │   │          headscale-admin  (shell, no ports, stops after 1 h)
- Browser ───────────443─▶│   └───────▶ headplane:3000 ─────────────────────────────┘ │
-                         │              /var/lib/headplane  (volume headplane-data)  │
-                         └───────────────────────────────────────────────────────────┘
- Peer-to-peer WireGuard traffic flows directly between clients, or via Tailscale's public DERP relays.
-```
-
-- **Two long-running services, one Compose project.** Each has its own named volume and health
-  check, and restarts automatically.
-- **`headscale-admin`, an optional admin shell** for creating API keys from Dokploy's web terminal.
-  It shares only Headscale's Unix socket, never its database, and stops itself after an hour
-  (see [First login](#first-login-to-headplane)).
-- **No published host ports.** Dokploy's Traefik terminates TLS and routes the two domains.
-  Headscale's metrics (`:9090`) and gRPC (`:50443`) listen only on the container's loopback.
-- **Headplane talks to Headscale over the internal Compose network** (`http://headscale:8080`).
-- **Configuration lives in two Dokploy file mounts:** `/etc/headscale/config.yaml` and
-  `/etc/headplane/config.yaml`. Dokploy generates both from the template at import time.
-  Headplane reads the Headscale config **read-only**, so it can display it but never change it.
-- **No Docker socket, no agent, no privileged mode.** All containers run with a read-only
-  root filesystem, `cap_drop: ALL` and `no-new-privileges`.
-
-## Prerequisites
-
-- A Dokploy instance with its Traefik reachable from the internet on **TCP 80 and 443**.
-  Port 80 is needed for Let's Encrypt HTTP-01 validation.
-- A domain whose DNS you control, or nothing at all if you use the generated `sslip.io` hosts.
-- Access to the Compose service in Dokploy, including its **Containers → Terminal**. SSH access to
-  the Docker host is only needed for the [fallback](#ssh-fallback) and for backups.
-- Optional, to build an import for your own domain: Node.js ≥ 20, plus this repository.
+- [Contributing and license](#contributing-and-license)
 
 ## Quick start
 
-### 1. Generate the import string
+### 1. DNS
 
-Dokploy imports templates as a Base64 string and has **no input prompt**. It resolves every
-variable on the server as soon as you import. To use your own domain, bake it into the string first:
+Point two names at your Dokploy server. The Headscale record must be **DNS only**
+(see [DNS](#dns)):
 
-```bash
-git clone <this repository> && cd <repository>
-npm ci
-npm run build:import -- --base-domain example.com
-# -> dist/import-base64.txt
-#    Headscale  https://headscale.example.com
-#    Headplane  https://headplane.example.com/admin
-#    MagicDNS   *.vpn.example.com
-```
-
-Each host name can be overridden on its own:
-
-```bash
-npm run build:import -- --base-domain example.com \
-  --headscale-host hs.example.com \
-  --headplane-host admin.example.com \
-  --magicdns-domain ts.example.com
-```
-
-Without `--base-domain`, the import keeps the template default `${domain}`. Dokploy then generates
-`headscale.<app>-<hash>-<server-ip>.sslip.io` (and the same for `headplane.` and `vpn.`).
-These names resolve to your server with no DNS setup at all, which is useful for a quick trial.
-The same generic string is attached to each [GitHub release](../../releases) and uploaded as a
-CI artifact.
-
-The string contains **no secrets**. Dokploy generates Headplane's cookie secret
-(`${hash:32}`, 32 hex characters from `crypto.randomBytes`) on the server during the import.
-
-### 2. Create DNS records
-
-See [DNS setup](#dns-setup). Do this before enabling Let's Encrypt.
-
-### 3. Import into Dokploy
-
-1. In a project, create a new **Compose** service (type *Docker Compose*). Use a fresh service:
-   importing into an existing one replaces its compose file, mounts and domains.
-2. Open the service → **Advanced** → **Import**, paste the string and load the preview.
-   It should show:
-   - **Domains:** `headscale` → port `8080` and `headplane` → port `3000`
-   - **Environment variables:** none. Every setting lives in the mounted config files.
-   - **Mounts:** `/etc/headscale/config.yaml` and `/etc/headplane/config.yaml`
-   - **Compose:** services `headscale`, `headplane` and `headscale-admin`; volumes
-     `headscale-data`, `headplane-data` and `headscale-socket`
-3. Confirm the import.
-
-### 4. Enable HTTPS on both domains
-
-Dokploy creates imported domains with **HTTPS on** but **Certificate Provider: None**. It always
-sets that provider on import, whatever the template says. For each of the two domains:
-**Domains** → edit → **Certificate Provider: Let's Encrypt** → save.
-See [HTTPS certificates](#https-certificates).
-
-### 5. Deploy
-
-Click **Deploy**. Headplane and the admin helper wait until Headscale reports healthy. Under
-**Containers**, all three should show *running* (healthy) within about 30 seconds. Then:
-
-```bash
-curl -fsS https://headscale.example.com/health      # {"status":"pass"}
-```
-
-### 6. Sign in to Headplane
-
-Follow [First login to Headplane](#first-login-to-headplane).
-
-## DNS setup
-
-Dokploy does **not** create DNS records. At your DNS provider, create:
-
-| Name | Type | Value | Notes |
-| --- | --- | --- | --- |
-| `headscale.example.com` | A (and AAAA if you have IPv6) | server IP | **DNS only.** Must not be proxied (see below) |
-| `headplane.example.com` | A (and AAAA) | server IP | Plain DNS recommended |
-| `vpn.example.com` | — | — | **No record.** The MagicDNS suffix is resolved inside the tailnet |
-
-**Cloudflare users:** the Headscale record must be *DNS only* (grey cloud). Cloudflare's proxy and
-Cloudflare Tunnel can't carry the Tailscale control protocol, a WebSocket upgrade over `POST`
-([Headscale docs](https://headscale.net/stable/ref/integration/reverse-proxy/#cloudflare)).
-Cloudflare *Origin* certificates are not publicly trusted either, so Tailscale clients reject them.
-
-Check propagation before requesting certificates:
-
-```bash
-dig +short headscale.example.com
-dig +short headplane.example.com
-```
-
-## HTTPS certificates
-
-TLS is terminated by Dokploy's Traefik. With **Certificate Provider: Let's Encrypt**, Traefik
-requests certificates with the HTTP-01 challenge. That needs:
-
-- The DNS records above pointing at the Dokploy server
-- TCP 80 reachable from the internet, with nothing else answering on it
-- A redeploy after changing domain settings (Dokploy reminds you of this for Compose services)
-
-While Let's Encrypt is pending or failing, Traefik serves its self-signed default certificate.
-Browsers then warn, Tailscale clients refuse to connect, and Headplane login fails because its
-cookie is `Secure`. If Traefik already holds a valid certificate for these hosts (for example a
-wildcard certificate added in Dokploy), *Certificate Provider: None* works as well.
-
-Check the certificate:
-
-```bash
-curl -vI https://headscale.example.com/health 2>&1 | grep -E "subject:|issuer:|HTTP/"
-```
-
-## Configuration and environment variables
-
-The template defines these variables. Dokploy resolves them once, at import time:
-
-| Variable | Default | Used for |
+| Name | Type | Value |
 | --- | --- | --- |
-| `base_domain` | `${domain}` (generated `sslip.io` host) | Base of all host names. Set with `--base-domain` |
-| `headscale_host` | `headscale.${base_domain}` | Headscale domain, `server_url`, Headplane `public_url` |
-| `headplane_host` | `headplane.${base_domain}` | Headplane domain and `base_url` |
-| `magicdns_domain` | `vpn.${base_domain}` | `dns.base_domain` (MagicDNS suffix). Must not equal, or be a parent of, the Headscale host |
-| `headplane_cookie_secret` | `${hash:32}` | Headplane session encryption. Exactly 32 characters |
+| `headscale.example.com` | A / AAAA | server IP |
+| `headplane.example.com` | A / AAAA | server IP |
 
-**No container environment variables are required.** Every setting is written into the two
-mounted files. You can change them after import under **Advanced → Mounts**, then redeploy:
+### 2. Install the template
 
-- `/etc/headscale/config.yaml`: the full [Headscale 0.29.5 configuration](https://github.com/juanfont/headscale/blob/v0.29.5/config-example.yaml)
-- `/etc/headplane/config.yaml`: the [Headplane 0.8.1 configuration](https://github.com/tale/headplane/blob/v0.8.1/config.example.yaml)
+**From Dokploy's Templates catalog** (recommended):
+
+1. Project → **Create Service → Template**. Enter this repository as **Base URL**:
+   `https://raw.githubusercontent.com/BogdanGorelkin/dokploy-headscale-headplane/<tag-or-commit>`
+   (the repository must be public; until the template is accepted into the official catalog).
+2. Search for **Headscale + Headplane** → **Create**. Dokploy creates the service but does not
+   deploy it yet.
+
+**Or by Base64 import:** create an empty Compose service, open **Advanced → Import** and paste
+`import-base64.txt` from a [release](../../releases). To bake in your domain, build it
+yourself: `npm ci && npm run build:import -- --base-domain example.com`.
+
+### 3. Configure before the first deploy
+
+1. **Advanced → Enable Isolated Deployment.** Required if another stack on the server has a
+   service named `headscale`, and recommended otherwise.
+2. **Environment:** set your host names (the template starts with generated `*.sslip.io`
+   names):
+
+   ```
+   HEADSCALE_HOST=headscale.example.com
+   HEADPLANE_HOST=headplane.example.com
+   MAGICDNS_DOMAIN=vpn.example.com
+   HEADPLANE_COOKIE_SECRET=<leave as generated>
+   ```
+
+3. **Domains:** edit both domains to the same hosts as above. Keep the Headplane path
+   `/admin/`, and set **Certificate Provider: Let's Encrypt**.
+
+### 4. Deploy
+
+**Deploy**. Under **Containers**, `headscale-config` runs and exits (0), then `headscale`,
+`headplane` and `headscale-admin` become *healthy*.
+
+```bash
+curl -fsS https://headscale.example.com/health   # {"status":"pass"}
+```
+
+### 5. First login
+
+**Containers → headscale-admin → ⋯ → Terminal → /bin/sh tab**, then run:
+
+```sh
+headscale apikeys create --expiration 90d
+```
+
+Paste the key at `https://headplane.example.com/admin/`. See [First login without SSH](#first-login-without-ssh).
+
+## Architecture
+
+```mermaid
+flowchart LR
+  subgraph internet[Internet]
+    C[Tailscale clients]
+    B[Browser]
+  end
+  subgraph host[Dokploy server]
+    T[Traefik 3.6]
+    subgraph app[Compose project]
+      R[headscale-config<br/>one-shot renderer]
+      HS[headscale<br/>distroless]
+      HP[headplane<br/>distroless]
+      A[headscale-admin<br/>busybox shell, 1 h]
+    end
+    E[(Environment tab)]
+    M[(Mount templates)]
+    D1[(headscale-data)]
+    D2[(headplane-data)]
+    S[(headscale-socket<br/>tmpfs)]
+  end
+  C -- "HTTPS 443" --> T
+  B -- "HTTPS 443" --> T
+  T -- "headscale host" --> HS
+  T -- "headplane host /admin/" --> HP
+  T -. "/ → 302 /admin/, probes 404, methods 405" .-> T
+  E --> R
+  M --> R
+  R -- "rendered config (read-only)" --> HS
+  R -- "rendered config (read-only)" --> HP
+  HP -- "HTTP API (Compose network)" --> HS
+  HS --- D1
+  HP --- D2
+  HS --- S
+  A -- "CLI over Unix socket" --- S
+```
+
+| Service | Runs | Purpose |
+| --- | --- | --- |
+| `headscale-config` | Once per deploy, then exits 0 | Validates the Environment and renders both config files from the mount templates |
+| `headscale` | Always | Control server (distroless, read-only) |
+| `headplane` | Always | Web UI under `/admin/` (distroless, read-only) |
+| `headscale-admin` | Up to 1 hour per deploy or Start | Shell for creating API keys from Dokploy's terminal |
+
+| Volume | Contents |
+| --- | --- |
+| `headscale-data` | `db.sqlite` (+ WAL), `noise_private.key`: all state and the server identity |
+| `headplane-data` | Headplane database (sessions, roles) |
+| `headscale-config`, `headplane-config` | Rendered configuration, re-created on every deploy |
+| `headscale-socket` | Headscale's admin socket on tmpfs, shared only with `headscale-admin` |
+
+No host ports are published. Headscale's metrics (`:9090`) and gRPC (`:50443`) listen only on
+the container loopback. There is no Docker socket, no agent and no privileged mode. Every
+container runs read-only with `cap_drop: ALL` and `no-new-privileges`.
+
+## Configuration
+
+### Environment (the single place for instance-specific values)
+
+| Variable | Set by the template to | Used for |
+| --- | --- | --- |
+| `HEADSCALE_HOST` | `headscale.<base>` | `server_url`, Headplane's `public_url` |
+| `HEADPLANE_HOST` | `headplane.<base>` | Headplane `base_url`, the `/` redirect and filter routers |
+| `MAGICDNS_DOMAIN` | `vpn.<base>` | `dns.base_domain` (MagicDNS suffix). Must not equal, or be a parent of, `HEADSCALE_HOST` |
+| `HEADPLANE_COOKIE_SECRET` | 32 random hex characters (`${hash:32}`) | Headplane session encryption |
+
+`<base>` is `${domain}` in the catalog, which Dokploy turns into
+`<project>-<hash>-<server-ip>.sslip.io`. That name resolves to your server with no DNS setup,
+which is enough for a first test.
+
+**Changing values later:** edit the Environment (and the two Domains, if a host changes), then
+**Deploy**. `headscale-config` re-renders both files, and Compose restarts `headscale` and
+`headplane` (`depends_on … restart: true`). A redeploy without changes restarts nothing.
+
+**Invalid values** (for example an uppercase or malformed host name) make `headscale-config`
+fail with a clear message such as `error: HEADSCALE_HOST is invalid (expected a lowercase DNS
+name)`, and the deploy fails. Compose has already stopped the dependent services at that point,
+so the control plane stays down until the value is fixed and redeployed. Connected clients keep
+their existing peer-to-peer connections in the meantime.
+
+### Mount templates (everything else)
+
+**Advanced → Mounts** holds two templates, rendered on every deploy:
+
+- `/templates/headscale.yaml`: the full [Headscale 0.29.5 configuration](https://github.com/juanfont/headscale/blob/v0.29.5/config-example.yaml)
+- `/templates/headplane.yaml`: the [Headplane 0.8.1 configuration](https://github.com/tale/headplane/blob/v0.8.1/config.example.yaml)
+
+`{{HEADSCALE_HOST}}`-style placeholders are filled in from the Environment. An unknown
+placeholder fails the deploy. **After editing a template, Deploy and then Restart `headscale`
+and/or `headplane`** under **Containers**: the template text isn't part of the Compose
+definition, so a deploy re-renders the file without restarting the services.
 
 Notable defaults:
 
-- `policy.mode: database`. ACLs are stored in Headscale's database and edited in Headplane
-  (**Access Control**). Until you save a policy, **all nodes can reach each other**.
-- DERP: Tailscale's public relays. The embedded DERP server would need UDP/3478 published on
-  the host, which this template doesn't do.
-- DNS: MagicDNS on, global resolvers 1.1.1.1/1.0.0.1, `override_local_dns: true`.
-- `trusted_proxies`: the RFC 1918 ranges, so Headscale logs real client IPs from Traefik's
-  forwarded headers.
+- `policy.mode: database`. ACLs are edited in Headplane's **Access Control** page. Until a
+  policy is saved, **all nodes can reach each other**.
+- DERP: Tailscale's public relays. The embedded DERP needs UDP/3478 on the host, which this
+  template doesn't publish.
+- MagicDNS on; resolvers 1.1.1.1 / 1.0.0.1 (+ IPv6); `override_local_dns: true`.
+- `trusted_proxies`: the RFC 1918 ranges, so Headscale logs real client IPs from Traefik.
+- Headplane reads the Headscale config **read-only**. It displays DNS settings but can't change
+  them; edit the template instead.
 
-Both containers also honour environment overrides: `HEADSCALE_<KEY>` with `.` written as `_`,
-for example `HEADSCALE_LOG_LEVEL=debug`, and `HEADPLANE_<SECTION>__<KEY>`, for example
-`HEADPLANE_DEBUG=true`. Values set in the files are generally easier to keep track of.
+## DNS
 
-**Changing the domain after import:** update `server_url` and `dns.base_domain` in the Headscale
-mount, `base_url` and `public_url` in the Headplane mount, and the two domains, then redeploy.
-Changing `server_url` on a running tailnet means every client has to log in again with the new
-`--login-server`.
+Dokploy does not create DNS records.
 
-## First login to Headplane
-
-Headplane signs you in with a **Headscale API key**. Create the first one from Dokploy's web UI:
-
-1. Open the Compose service → **Containers**. Find `headscale-admin` (*running*). If it shows
-   *exited*, its one-hour idle timeout has passed: choose **⋯ → Start**.
-2. **⋯ → Terminal**, then pick the **/bin/sh** tab. The *Bash* tab can't work: the image has no bash.
-3. Run:
-
-   ```sh
-   headscale apikeys create --expiration 90d
-   ```
-
-   The key (`hskey-api-…`) is printed **only in your terminal session**. It isn't written to any
-   container log, file or environment variable, and Headscale stores only its hash.
-4. Copy it, open `https://headplane.example.com/admin` and paste it.
-   (`https://headplane.example.com/` without `/admin` returns 404 by design.)
-5. Close the terminal. Optionally choose **⋯ → Stop** on `headscale-admin`; otherwise it stops
-   by itself within the hour. Each redeploy starts it again for another hour.
-
-A session lasts at most 24 hours (`cookie_max_age`) and never longer than the key remains valid.
-The same shell manages keys later: `headscale apikeys list`,
-`headscale apikeys expire --prefix <prefix>`. Any other `headscale` command works there too
-(`users list`, `nodes list`, `preauthkeys create …`).
-
-### How the admin helper works
-
-`headscale-admin` runs the official **`headscale/headscale:<same version>-debug`** image. It is
-the same Headscale build plus a busybox shell. The production `headscale` container keeps its
-distroless image unchanged.
-
-- **The CLI talks to the running server through its Unix socket.** That socket is the gRPC admin
-  interface the `headscale` command uses locally; the CLI never opens the SQLite database. The
-  helper does not mount `headscale-data` at all, so there is no concurrent access to the database.
-- **The socket lives on a tmpfs-backed volume** (`headscale-socket`), shared only by `headscale`
-  and `headscale-admin` and never written to disk. Headplane does not get it. Headscale replaces
-  a stale socket on every start, so restarts are safe.
-- **No ports, no network listeners, no Docker socket.** The container idles with `sleep 3600` and
-  prints nothing. It has a read-only root filesystem, `cap_drop: ALL`, `no-new-privileges`, and
-  no restart policy, so after an hour it exits and stays stopped until you start it.
-- **Isolation:** Compose scopes the socket volume to this project, and the helper joins only the
-  project's own network. Access to its terminal follows Dokploy's permissions for this service.
-
-Anyone who can open this service's terminal in Dokploy can create admin keys while the helper
-runs. Dokploy users with that access can already redeploy the service with any configuration, so
-this adds no new privilege. To remove the helper entirely, delete the `headscale-admin` service
-and the `headscale-socket` volume from the compose file. Then create keys over SSH.
-
-### Approaches considered
-
-| Approach | Verdict |
+| Name | Requirement |
 | --- | --- |
-| Terminal into `headscale` | Impossible: the distroless image has no shell, and Dokploy's terminal needs `sh` or `bash` |
-| Switch production `headscale` to the `-debug` image | Rejected: puts a shell in the internet-facing container permanently |
-| One-shot bootstrap container that prints a key | Rejected: the key ends up in container logs |
-| Bootstrap that stores the key in a volume or env var | Rejected: keys at rest. Reading the volume would still need host access |
-| Dokploy *Schedules* running the CLI | Impossible and unsafe: runs `sh -c` in the target container, and output is kept in schedule logs |
-| Headplane proxy auth, or a bootstrap web endpoint | Rejected: trusts the shared Docker network, or exposes an endpoint |
-| Docker socket in a helper | Rejected: root on the host |
-| Remote gRPC with TLS | Chicken-and-egg: needs an API key |
-| **Debug-image helper on the socket, opened via Dokploy's Terminal** | **Chosen**: same CLI, server-side writes, no logs, no ports, time-limited |
-
-### SSH fallback
-
-If you can't use Dokploy's terminal (your Dokploy role lacks Docker access, or you removed the
-helper), create the key on the Docker host:
+| Headscale host | **DNS only.** Cloudflare's proxy ("orange cloud") and Cloudflare Tunnel can't carry the Tailscale control protocol, a WebSocket upgrade over `POST` ([Headscale docs](https://headscale.net/stable/ref/integration/reverse-proxy/#cloudflare)). It needs a publicly trusted certificate: Cloudflare *Origin* certificates are rejected by Tailscale clients |
+| Headplane host | Plain DNS recommended. Proxying through a CDN works, as it is ordinary HTTPS |
+| MagicDNS domain | **No record.** Resolved inside the tailnet |
 
 ```bash
-./scripts/create-api-key.sh                 # lists Headscale projects (Dokploy App Names)
-./scripts/create-api-key.sh <app-name> 90d
-
-# equivalent without the script:
-docker exec "$(docker ps -q -f label=com.docker.compose.project=<app-name> \
-                            -f label=com.docker.compose.service=headscale)" \
-  headscale apikeys create --expiration 90d
+dig +short headscale.example.com   # must be the server IP, not a CDN address
 ```
 
-**Optional single sign-on:** Headplane supports OIDC (`oidc:` section, see the
-[SSO docs](https://headplane.net/features/sso)). OIDC also needs `headscale.api_key` in the
-Headplane config, using a key created as above. Dokploy can additionally put a forward-auth
-provider in front of the Headplane domain (domain → **SSO Authentication**).
+## HTTPS
+
+TLS is terminated by Dokploy's Traefik. Dokploy creates the template's domains with HTTPS on
+and *Certificate Provider: None*, whatever the template says. Set **Let's Encrypt** on both
+domains (HTTP-01: DNS must point at the server and TCP 80 must be reachable), or rely on a
+certificate already loaded into Traefik that covers the host (for example a wildcard). Redeploy
+after changing domain settings.
+
+Until a valid certificate is served, browsers warn, Tailscale clients refuse to connect, and
+Headplane login fails because its session cookie is `Secure`.
+
+## First login without SSH
+
+Headplane signs you in with a **Headscale API key**. The production images are distroless and
+have no shell, so the template adds **`headscale-admin`**. It runs the official
+`headscale:<same version>-debug` image, which is the same Headscale build plus busybox.
+
+1. **Containers → `headscale-admin`**. If it shows *exited*, its one-hour idle timeout passed:
+   **⋯ → Start**.
+2. **⋯ → Terminal → /bin/sh** tab. The *Bash* tab fails: the image has no bash.
+3. Run `headscale apikeys create --expiration 90d`, copy the `hskey-api-…` value, and sign in at
+   `https://<HEADPLANE_HOST>/admin/`.
+
+The key is printed **only in your terminal session**: Dokploy streams terminal output to the
+browser without storing it, the helper writes nothing to its logs, and Headscale stores only a
+hash. The same shell manages keys later (`headscale apikeys list`,
+`headscale apikeys expire --prefix <prefix>`) and runs any other `headscale` command.
+
+How the helper is contained:
+
+- **No database access.** The CLI asks the running server to act, through its Unix socket; the
+  helper doesn't mount `headscale-data`, so SQLite is never opened twice.
+- **The socket lives on tmpfs** (`headscale-socket`) and is shared only with `headscale`;
+  Headplane doesn't get it. Compose scopes the volume to this project.
+- No ports, no listeners, no Docker socket. Read-only, `cap_drop: ALL`, no restart policy: after
+  an hour it exits and stays stopped until you Start it or redeploy.
+- While it runs, anyone who can open this service's terminal in Dokploy can create admin keys.
+  Dokploy users with that access can already redeploy the service with any configuration, so
+  this grants no new privilege.
+
+| Alternative | Why not |
+| --- | --- |
+| Terminal into `headscale` | Distroless: no shell |
+| `-debug` image for production `headscale` | Permanent shell in the internet-facing container |
+| One-shot container that prints a key | Key in container logs |
+| Key stored in a volume or env var | Key at rest, and reading it still needs the host |
+| Dokploy Schedules | Runs `sh -c` in the target container, and output is kept in schedule logs |
+| Headplane proxy auth, bootstrap web endpoint, Docker socket | Trusts the shared network, exposes an endpoint, or grants root |
+
+**SSH fallback** (Dokploy role without terminal access): on the Docker host,
+`./scripts/create-api-key.sh` lists Headscale deployments, and
+`./scripts/create-api-key.sh <app-name> 90d` creates a key.
+
+## How Headplane is routed
+
+Headplane serves everything under `/admin/`; its server answers every other path with a React
+Router error and a stack trace in the logs. The template therefore routes only `/admin/` to it,
+and Traefik answers the rest:
+
+| Request | Answer | Reaches Headplane |
+| --- | --- | --- |
+| `GET /`, `GET /admin` (query string kept) | **302** → `https://<host>/admin/` | no |
+| `HEAD /`, `HEAD /admin` | **307** → `/admin/` (Traefik's redirect middleware answers non-GET methods with 307; for HEAD it is equivalent to 302) | no |
+| `http://…/` | **302** → `https://<host>/admin/` (one hop) | no |
+| Any other path outside `/admin/` (`/favicon.ico`, `/xmlrpc.php`, `/.env`, …) and any method on `/` other than GET/HEAD | **404** | no |
+| `/admin/…` dot-files and `.php`/`.asp(x)`/`.jsp`/`.cgi` probes | **404** | no |
+| `/admin/…` with a method the UI never sends (anything but GET, HEAD, POST, PATCH) | **405** | no |
+| Everything else under `/admin/` (pages, assets, login, ACL editor's `PATCH`, SSE) | forwarded | yes |
+
+The routers and middlewares are labels on the `headplane` service, named
+`<app-name>-headplane-*`. They never reference Dokploy's generated router names, and they work
+in shared and isolated network mode. The 404/405 answers come from Traefik's `noop@internal`
+service, rewritten by an `errors` middleware. Other unknown paths under `/admin/` (for example
+`/admin/debug/x`) still reach Headplane and are logged by it; Headplane's route table isn't
+duplicated into Traefik, to avoid breaking new Headplane pages after an upgrade.
 
 ## Connecting Tailscale clients
 
-Install the official [Tailscale client](https://tailscale.com/download) and point it at your server.
-
-**Linux / macOS (CLI):**
-
 ```bash
-# with a pre-auth key (no browser step)
 sudo tailscale up --login-server https://headscale.example.com --authkey <pre-auth-key>
-
-# or interactively: prints a URL with a registration key
+# or interactively; register the printed key in Headplane: Machines → Add Device → Register Machine Key
 sudo tailscale up --login-server https://headscale.example.com
 ```
 
-For the interactive flow, register the device in Headplane. Go to **Machines → Add Device →
-Register Machine Key**, paste the URL or `hskey-authreq-…` key it printed, and choose the owner.
+GUI clients (Windows, macOS, iOS, Android): set a custom control server URL following
+[Headscale's client docs](https://headscale.net/stable/usage/getting-started/).
 
-**Windows, macOS app, iOS, Android:** set a custom control server URL
-(`https://headscale.example.com`) in the client's settings or login options, following
-[Headscale's client documentation](https://headscale.net/stable/usage/getting-started/).
+## Pre-authentication keys
 
-After joining, `tailscale status` lists your peers, and `ping <hostname>.vpn.example.com` uses MagicDNS.
+Headplane: **Users** → create a user, then **Settings → Manage Auth Keys → Create pre-auth key**
+(also **Machines → Add Device → Generate Pre-auth Key**). Choose *Reusable* to enrol several
+machines, and *Ephemeral* for short-lived ones (removed after 30 minutes offline). Keep
+expirations short. The key is shown once. CLI equivalent in the admin shell:
+`headscale preauthkeys create --user <id> --reusable --expiration 24h`.
 
-## Reusable pre-authentication keys
+## Security
 
-In Headplane: **Users** → create a user. Then **Settings → Manage Auth Keys → Create pre-auth key**
-(also reachable from **Machines → Add Device → Generate Pre-auth Key**):
-
-- **User:** the owner of the machines that join with the key
-- **Reusable:** on, to enrol several machines with one key (servers, CI runners)
-- **Ephemeral:** on for short-lived machines. They are removed after being offline for 30 minutes
-- **Expiration:** keep it short and create new keys rather than long-lived ones
-
-Copy the key straight away; it is shown only once. The CLI equivalent is
-`headscale preauthkeys create --user <user-id> --reusable --expiration 24h`, run via `docker exec`.
-A reusable key enrols any number of machines until it expires, so treat it like a password and
-expire it in Headplane once you no longer need it.
-
-## Security considerations
-
-- **Admin helper:** while `headscale-admin` runs, anyone with terminal access to this service in
-  Dokploy can create API keys. It shares Headscale's socket only, has no ports, stops after an
-  hour, and runs the same Headscale version. Stop it after use if you prefer.
-- **Headplane access requires a valid, unexpired Headscale API key.** Unauthenticated requests
-  are redirected to the login page. Anyone holding an API key has full control of the tailnet.
-- **Headscale's REST API (`/api/v1`) is reachable on the public Headscale domain**, as in every
-  standard Headscale deployment. It accepts only API keys. Keep keys short-lived and expire unused ones.
-- **Default policy allows all traffic between nodes.** Write an ACL policy in Headplane
-  (**Access Control**) before adding devices that should not reach each other.
-- **Secrets live in Dokploy.** The cookie secret sits in the Headplane mount, which Dokploy stores
-  in its database and writes to `/etc/dokploy/compose/<app>/files/` on the host. Anyone with access
-  to the Dokploy project can read it.
-- **Shared `dokploy-network`:** Dokploy attaches every service with a domain to one shared network.
-  If another stack on the same host also has a service named `headscale` with a domain, the name
-  `headscale` can resolve to the wrong container. To isolate the stack, turn on
-  **Advanced → Enable Isolated Deployment** before deploying.
-- **Container hardening:** read-only root filesystems, `cap_drop: ALL`, `no-new-privileges`, no
-  host ports, no Docker socket, metrics and gRPC on loopback only.
-- **`trusted_proxies`** trusts the private address ranges because Traefik reaches Headscale from
-  Docker networks. A container on those networks could therefore fake the client IP that
-  Headscale logs. It cannot affect authentication.
-- Headscale's `/health` endpoint is public, which is normal and harmless.
+- **Authentication:** Headplane requires a valid, unexpired Headscale API key (or OIDC, if you
+  configure it). Sessions last at most 24 hours and never longer than the key remains valid.
+- **Headscale's REST API is public** on the Headscale host (as in every standard deployment) and
+  accepts only API keys. Keep keys short-lived and expire unused ones.
+- **Default policy allows all traffic.** Save an ACL policy before adding devices that shouldn't
+  reach each other.
+- **Secrets:** the cookie secret lives in the Environment tab (Dokploy's database) and in the
+  rendered `headplane-config` volume, not in Git or in logs. The import string and the catalog
+  contain no secrets; Dokploy generates them on the server.
+- **Admin helper:** see [First login without SSH](#first-login-without-ssh). Stop it after use if
+  you prefer; it stops itself within an hour.
+- **Isolation:** enable *Isolated Deployment*. Otherwise Dokploy's shared `dokploy-network` lets
+  another stack's service named `headscale` shadow ours.
+- **Containers:** read-only root filesystems, `cap_drop: ALL`, `no-new-privileges`, no host
+  ports, no Docker socket, metrics and gRPC on loopback only.
+- **Request filtering:** junk paths and unexpected methods are answered by Traefik and never
+  reach Headplane (see [routing](#how-headplane-is-routed)).
+- **`trusted_proxies`** trusts private ranges because Traefik reaches Headscale over Docker
+  networks. A container on those networks could therefore fake the client IP that Headscale
+  logs; this doesn't affect authentication.
+- Reporting vulnerabilities: see [SECURITY.md](SECURITY.md).
 
 ## Backup and restore
 
-What matters:
-
-| Volume | Contents | If lost |
-| --- | --- | --- |
-| `headscale-data` | `db.sqlite` (+ WAL), `noise_private.key` | All users, nodes and keys are gone. A new Noise key forces every client to re-register |
-| `headplane-data` | Headplane database (sessions, roles) | Users sign in again |
-| Dokploy mounts | Both config files (including the cookie secret) | Re-import or rewrite them |
-
-`scripts/backup.sh` stops both containers briefly, so SQLite and its WAL are copied in a
-consistent state. It then archives both volumes and the Dokploy mount files and starts the
-containers again. Run it on the Docker host:
+`headscale-data` is what matters: the database and `noise_private.key` (the server identity).
+Losing the key forces every client to re-register.
 
 ```bash
 ./scripts/backup.sh <app-name> /root/backups/headscale-$(date +%F)
-# headscale-data.tar.gz  headplane-data.tar.gz  files.tar.gz  MANIFEST (images + SHA-256)
+./scripts/restore.sh <app-name> /root/backups/headscale-2026-10-22   # asks for confirmation
 ```
 
-Restore into a deployment that has been deployed at least once, so its volumes exist:
+- `backup.sh` stops both services for a few seconds (consistent SQLite + WAL), archives
+  `headscale-data`, `headplane-data` and the Dokploy mount templates, and writes a `MANIFEST`
+  with SHA-256 checksums.
+- `restore.sh` replaces the volumes found in the backup; `headplane-data` is optional. The target
+  must have been deployed once, so its volumes exist.
+- Both scripts run on the Docker host (SSH). The backup contains private keys: store it encrypted.
+- Dokploy's *Volume Backups* can also back up `headscale-data` to S3. Stop the services during
+  the backup for a consistent copy.
 
-```bash
-./scripts/restore.sh <app-name> /root/backups/headscale-2026-10-22      # asks for confirmation
-```
-
-`restore.sh` replaces both volumes and leaves the Dokploy mounts alone. If you changed them,
-compare with `files.tar.gz` and re-apply your edits under **Advanced → Mounts**. The backup holds
-private keys: store it encrypted. Dokploy's own *Volume Backups* feature can also back up the two
-named volumes to S3. If you use it, stop the services during the backup for a consistent SQLite copy.
+Migrating from another Headscale installation: see [docs/MIGRATION-HABS.md](docs/MIGRATION-HABS.md)
+for a staged, reversible procedure.
 
 ## Upgrading
 
-1. Read the release notes for [Headscale](https://github.com/juanfont/headscale/releases) and
-   [Headplane](https://github.com/tale/headplane/releases). Headscale must be upgraded **one minor
-   version at a time** (0.28 → 0.29 → 0.30), always to the latest patch release.
-   Check [Headplane's compatibility](https://headplane.net) with the new Headscale version.
-2. Back up (`scripts/backup.sh`).
-3. In Dokploy, edit the image tags in the service's compose file (**General**). Keep
-   `headscale-admin` on the same version as `headscale`, with the `-debug` suffix. Compare your
-   config mounts with the new upstream example configs, then **Deploy**.
-4. Check that both containers are healthy and that `headscale nodes list` shows your machines.
+1. Read the [Headscale](https://github.com/juanfont/headscale/releases) and
+   [Headplane](https://github.com/tale/headplane/releases) release notes. Headscale must be
+   upgraded **one minor version at a time**.
+2. Back up.
+3. Either install the new template version over the existing service (**Advanced → Import**
+   with the new release's string), or edit the image tags in **General**. Keep `headscale-config`
+   and `headscale-admin` on the same version as `headscale`, with the `-debug` suffix.
+4. **Deploy**, then check that all services are healthy and `headscale nodes list` shows your
+   machines.
 
-**Deployments made from an earlier version of this template** (without `headscale-admin`): paste
-the new `docker-compose.yml` into **General** and **Deploy**. The existing volumes, mounts and
-domains are reused; the end-to-end test covers exactly this upgrade.
+**Re-importing** replaces the compose file, Environment, mounts and domains and keeps the
+volumes. Afterwards, set your host names in the Environment and Domains again, and choose Let's
+Encrypt again. A new cookie secret is generated, so everyone signs in again.
 
-Re-importing a newer version of this template also works, but it **replaces the mounts and
-domains**: your config edits are lost, a new cookie secret is generated (everyone signs in
-again), and the certificate providers reset to *None*. Volumes are kept.
-
-This repository pins exact versions. Floating tags such as `latest` or `0.8` are rejected by CI.
+**From earlier versions of this template** (configuration in `/etc/headscale/config.yaml`
+mounts, no `headscale-config` service): re-import as above. The end-to-end test covers exactly
+this upgrade, from `5bca341`.
 
 ## Troubleshooting
 
-| Symptom | Likely cause and fix |
+| Symptom | Cause and fix |
 | --- | --- |
-| Headplane login does nothing or returns to the login page | Headplane is served over HTTP or with an untrusted certificate. The `Secure` cookie is then dropped. Enable HTTPS and Let's Encrypt on the domain and redeploy |
-| Browser shows "TRAEFIK DEFAULT CERT" | Let's Encrypt hasn't issued yet: check DNS, port 80 reachability, *Certificate Provider* setting, Traefik logs |
-| `tailscale up` hangs or reports TLS errors | Same as above, or the Headscale record is proxied by Cloudflare. Switch it to DNS only |
-| Headplane container restarts with "Unable to load configuration" | Invalid Headplane mount. Every key listed in the log message must exist with the right type. `cookie_secret` must be exactly 32 characters |
-| Headscale unhealthy and Headplane never starts | `docker logs <headscale container>`. Usually a config error. Validate with `docker run --rm -v <file>:/etc/headscale/config.yaml:ro docker.io/headscale/headscale:0.29.5 configtest` |
-| Error `is a directory` for `/etc/.../config.yaml` | The mount file didn't exist at deploy time, so Docker created a directory. Re-create the mount under **Advanced → Mounts** and redeploy |
-| `https://headplane…/` shows 404 | Expected. Use `/admin` |
-| DNS page in Headplane is read-only | By design: the Headscale config is mounted read-only. Edit the Headscale mount in Dokploy and redeploy |
-| Headplane reports the wrong Headscale version or odd data | Possible name collision on `dokploy-network`. Enable *Isolated Deployment* |
-| No shell when opening a terminal on `headscale` or `headplane` | Expected: distroless images. Use the `headscale-admin` container |
-| Terminal on `headscale-admin` shows `executable file not found` | You picked the *Bash* tab. Use **/bin/sh** |
-| `headscale-admin` is *exited* | Its one-hour idle timeout passed. **Containers → ⋯ → Start** |
-| `headscale apikeys create` in the helper: `connection refused` / socket errors | Headscale isn't running or healthy: check its logs, then Start the helper again |
-
-Useful commands, run on the host:
-
-```bash
-P=<app-name>
-docker ps --filter label=com.docker.compose.project=$P
-docker logs $(docker ps -q -f label=com.docker.compose.project=$P -f label=com.docker.compose.service=headscale)
-docker exec $(docker ps -q -f label=com.docker.compose.project=$P -f label=com.docker.compose.service=headscale) headscale nodes list
-```
+| Deploy fails: `service "headscale-config" didn't complete successfully` | An Environment value is invalid. Check **Containers → headscale-config → Logs**, fix it, redeploy |
+| Headplane login returns to the login page | Headplane isn't served over valid HTTPS (Secure cookie). Set Let's Encrypt on the domain and redeploy |
+| Browser shows "TRAEFIK DEFAULT CERT" | Certificate not issued yet: check DNS, port 80, *Certificate Provider* |
+| `tailscale up` hangs or reports TLS errors | Same as above, or the Headscale record is proxied by Cloudflare |
+| `https://<headplane>/` doesn't redirect | `HEADPLANE_HOST` differs from the Headplane domain host; keep them equal |
+| 404 on every Headplane page | The Headplane domain path isn't `/admin/` |
+| Headplane shows wrong data or can't connect | Possibly another `headscale` service on `dokploy-network`: enable Isolated Deployment |
+| A mount template edit has no effect | Deploy, then Restart `headscale`/`headplane` |
+| Terminal: `executable file not found` | You picked the *Bash* tab; use **/bin/sh** |
+| `headscale-admin` is *exited* | Idle timeout reached: **⋯ → Start** |
+| No shell on `headscale` / `headplane` | Expected (distroless); use `headscale-admin` |
 
 ## Differences from the upstream Docker examples
 
-| Topic | Headscale / Headplane docs | This template | Why |
-| --- | --- | --- | --- |
-| Ports | `ports: 8080, 9090, 3000` | `expose` only | Traefik routes the traffic. Dokploy templates must not publish ports |
-| Images | `<VERSION>` / `headplane:latest` | Exact pinned tags | Reproducible deployments. Headplane 0.8.0 broke actions behind TLS proxies |
-| `container_name` | `headscale`, `headplane` | none | Dokploy names containers. Fixed names would collide |
-| Headplane ↔ Headscale | Shared writable config, Docker socket, container label | Read-only config, no socket, no label | No root-equivalent access. The UI can't edit the Headscale config |
-| DNS and settings editing in Headplane | Available (with socket) | Read-only display | Consequence of the above. Edit the mount in Dokploy |
-| ACL editing | Policy file or database | `policy.mode: database` | Full ACL editing in Headplane without file access |
-| Health checks | Optional | Both services, with `depends_on: service_healthy` | Ordered start-up and visible health in Dokploy |
-| Hardening | `read_only` (Headscale) | `read_only`, `cap_drop: ALL` and `no-new-privileges` on both | Tested to work in the end-to-end test |
-| Reverse proxy | Same host, Headplane on `/admin`, CORS middleware | Separate host per service | Dokploy routes one service per domain. Headplane calls the API from its server, so no CORS is needed |
-| Embedded DERP | Optional | Disabled | Would need UDP/3478 published on the host |
-| CLI access | `docker exec headscale …` on the host | `headscale-admin` helper, opened from Dokploy's terminal | Keys can be created from the Dokploy UI, and the production image stays distroless |
+| Topic | Upstream examples | This template |
+| --- | --- | --- |
+| Configuration | Hand-edited files | Environment tab + rendered templates, validated on every deploy |
+| Ports | Published `8080`, `9090`, `3000` | `expose` only; Traefik routes |
+| Images | `<VERSION>`, `headplane:latest` | Exact pins (Headplane 0.8.0 broke actions behind TLS proxies) |
+| Headplane ↔ Headscale | Shared writable config, Docker socket | Read-only config, no socket |
+| Headplane routing | `/admin` on the Headscale host, CORS middleware | Own host, only `/admin/` forwarded, root redirect, 404/405 filtering |
+| CLI access | `docker exec` on the host | `headscale-admin` shell in Dokploy's terminal |
+| ACLs | File or database | `policy.mode: database`, editable in Headplane |
+| Hardening | `read_only` for Headscale | `read_only`, `cap_drop: ALL`, `no-new-privileges` everywhere |
+| Embedded DERP | Optional | Disabled (would need UDP/3478) |
 
 ## Testing
 
-| Layer | Command | Needs | What it covers |
-| --- | --- | --- | --- |
-| Static | `npm run validate` | Node | YAML/TOML/meta, Dokploy conventions, variable references, unresolved placeholders, generated configs, secrets, import round-trip |
-| Static | `node tests/validate-negative.mjs` | Node | 20 deliberately broken templates must be rejected (including unsafe helper changes) |
-| Upstream | `scripts/check-upstream.sh <Dokploy/templates checkout>` | Node | The official Dokploy/templates validators |
-| End-to-end | `npm run test:e2e` | Docker | Real containers (74 checks): upgrade from the previous template, health, login, users/keys via Headplane, 2 Tailscale nodes, admin-helper bootstrap the way Dokploy's terminal runs it (no key in logs, no DB access, timeout and Start), restart, recreate, fresh install, backup/restore |
-| Live Dokploy | [docs/TESTING.md](docs/TESTING.md) | A Dokploy instance | Import preview, Traefik routing, Let's Encrypt, real clients |
+| Layer | Command | Covers |
+| --- | --- | --- |
+| Static | `npm run validate` | YAML/TOML/meta, Dokploy conventions, Compose variables, template placeholders, generated configs, label safety, secrets |
+| Negative | `npm run test:negative` | 29 broken variants rejected (helper, renderer, labels, domains, secrets…) |
+| Catalog | `npm run check:catalog` | Installs from this checkout served as a template catalog, using Dokploy's fetch and deploy logic |
+| Upstream | `scripts/check-upstream.sh <Dokploy/templates checkout>` | The official Dokploy/templates validators |
+| Routing | `npm run test:routing` | Real Traefik 3.6.25 wired like Dokploy, shared and isolated networks: redirects, no loops, 404/405, assets, login, cookies, users, pre-auth keys, ACL `PATCH`, Headscale API, Tailscale over HTTPS (62 checks per mode) |
+| End-to-end | `npm run test:e2e` | Upgrade by re-import from `5bca341`, helper bootstrap, Environment changes, invalid values, template edits, restart, recreate, fresh install, backup/restore, Headscale-only migration, clients reconnecting without re-registration (95 checks) |
+| Live Dokploy | [docs/TESTING.md](docs/TESTING.md) | Catalog install, Let's Encrypt, real devices |
 
-The end-to-end test runs without Dokploy and Traefik. It renders the template through a faithful
-port of Dokploy's template processor ([scripts/lib/dokploy.mjs](scripts/lib/dokploy.mjs)) and
-sends the headers Traefik would. CI runs every automated layer on each push and pull request.
-Tagged releases attach the generic import string.
+All automated layers run in CI. Tests use `scripts/lib/dokploy.mjs` and
+`scripts/lib/dokploy-deploy.mjs`, ports of Dokploy's template processor and deploy-time
+labelling, so they exercise exactly what Dokploy generates.
 
-## Contributing
+## Contributing and license
 
-Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the development
-workflow, the version-bump checklist and how this blueprint is submitted to
-[Dokploy/templates](https://github.com/Dokploy/templates).
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [CHANGELOG.md](CHANGELOG.md). Licensed under the
+[MIT License](LICENSE); two tooling files derived from Dokploy are Apache-2.0, see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

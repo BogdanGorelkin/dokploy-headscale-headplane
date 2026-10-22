@@ -10,11 +10,16 @@
   "scripts": {
     "validate": "node scripts/validate.mjs",
     "build:import": "node scripts/build-import.mjs",
+    "build:catalog": "node scripts/build-catalog.mjs",
+    "check:catalog": "node scripts/check-catalog.mjs --serve-local",
     "render": "node scripts/render.mjs",
+    "test:negative": "node tests/validate-negative.mjs",
+    "test:routing": "bash tests/routing-traefik.sh shared && bash tests/routing-traefik.sh isolated",
     "test:e2e": "bash tests/e2e-local.sh"
   },
   "devDependencies": {
     "toml": "4.2.0",
     "yaml": "2.8.3"
-  }
+  },
+  "license": "MIT"
 }

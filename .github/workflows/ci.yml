@@ -39,23 +39,31 @@ jobs:
       - name: Validator rejects known-bad templates
         run: node tests/validate-negative.mjs
 
+      - name: Catalog meta.json is in sync with the blueprint
+        run: node scripts/build-catalog.mjs --check
+
+      - name: Install from this checkout as a Dokploy template catalog
+        run: node scripts/check-catalog.mjs --serve-local
+
       # Pinned releases instead of the runner's preinstalled ShellCheck, so local
       # and CI results match. Both must pass (0.10 flags SC2015 cases 0.11 doesn't).
       - name: Lint shell scripts (ShellCheck 0.10.0 and 0.11.0)
         run: |
           for version in v0.10.0 v0.11.0; do
             echo "::group::shellcheck $version"
-            docker run --rm -v "$PWD:/mnt" -w /mnt "koalaman/shellcheck:$version" scripts/*.sh tests/*.sh
+            docker run --rm -v "$PWD:/mnt" -w /mnt "koalaman/shellcheck:$version" -x scripts/*.sh tests/*.sh
             echo "::endgroup::"
           done
 
       - name: Lint workflows
         run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
 
-      - name: Docker Compose syntax (rendered as Dokploy lays it out)
+      - name: Docker Compose syntax (as imported, and with Dokploy's deploy-time labels/networks)
         run: |
-          node scripts/render.mjs --out .render/ci --app-name ci --base-domain example.com
-          docker compose --project-directory .render/ci/code -f .render/ci/code/docker-compose.yml config --quiet
+          for routing in none shared isolated; do
+            node scripts/render.mjs --out ".render/ci-$routing" --app-name ci --base-domain example.com --dokploy-routing "$routing"
+            docker compose --project-directory ".render/ci-$routing/code" -f ".render/ci-$routing/code/docker-compose.yml" config --quiet
+          done
 
       - name: Generate Dokploy Base64 import (generic, sslip.io)
         run: node scripts/build-import.mjs --out dist/import-base64.txt
@@ -123,8 +131,27 @@ jobs:
           fetch-depth: 0
       - run: docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.30.1 git /repo --redact --verbose
 
+  routing:
+    name: Routing behind Traefik (${{ matrix.mode }} network)
+    runs-on: ubuntu-latest
+    needs: static
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [shared, isolated]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Redirects, 404/405 filtering, login, users, pre-auth keys, Tailscale over HTTPS
+        run: bash tests/routing-traefik.sh ${{ matrix.mode }}
+
   e2e:
-    name: End-to-end (Docker, no Dokploy)
+    name: End-to-end (Docker, Dokploy-style Traefik)
     runs-on: ubuntu-latest
     needs: static
     timeout-minutes: 20
@@ -138,5 +165,5 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci --no-audit --no-fund
-      - name: Upgrade, helper bootstrap, manage, join nodes, restart, fresh install, backup and restore
+      - name: Re-import upgrade, helper bootstrap, Environment changes, restart, fresh install, backup and restore
         run: bash tests/e2e-local.sh

@@ -4,7 +4,10 @@
 #   scripts/restore.sh <app-name> <backup-dir> [--yes]
 #
 # The target deployment must have been deployed at least once (so its volumes
-# exist). The current contents of both volumes are REPLACED. Mount files
+# exist). The contents of the volumes found in the backup are REPLACED.
+# headscale-data.tar.gz is required; headplane-data.tar.gz is optional (a
+# backup of a Headscale-only installation restores Headscale and leaves
+# Headplane's data as it is). Mount files
 # (files.tar.gz) are not restored automatically: compare them with the
 # deployment's Advanced -> Mounts in Dokploy and copy any changes there, since
 # Dokploy rewrites mount files from its database when they are edited.
@@ -36,12 +39,18 @@ volume_of() {
 		--filter "label=com.docker.compose.volume=$1-data"
 }
 
+[[ -f "$src/headscale-data.tar.gz" ]] || { echo "error: $src/headscale-data.tar.gz missing" >&2; exit 1; }
+restore=()
 for svc in "${services[@]}"; do
-	[[ -f "$src/$svc-data.tar.gz" ]] || { echo "error: $src/$svc-data.tar.gz missing" >&2; exit 1; }
+	if [[ ! -f "$src/$svc-data.tar.gz" ]]; then
+		echo "note: no $svc-data.tar.gz in the backup; leaving $svc-data unchanged" >&2
+		continue
+	fi
 	[[ -n "$(volume_of "$svc")" ]] || {
 		echo "error: volume $svc-data not found for '$project'; deploy it once first" >&2
 		exit 1
 	}
+	restore+=("$svc")
 done
 
 if [[ -f "$src/MANIFEST" ]]; then
@@ -61,7 +70,7 @@ for svc in headplane headscale; do
 done
 [[ ${#ids[@]} -gt 0 ]] && docker stop "${ids[@]}" >/dev/null
 
-for svc in "${services[@]}"; do
+for svc in "${restore[@]}"; do
 	vol=$(volume_of "$svc")
 	echo "Restoring $vol"
 	docker run --rm -v "$vol:/data" -v "$src:/backup:ro" "$HELPER_IMAGE" \

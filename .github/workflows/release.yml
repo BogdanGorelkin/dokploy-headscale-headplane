@@ -18,12 +18,17 @@ jobs:
           cache: npm
       - run: npm ci --no-audit --no-fund
       - run: node scripts/validate.mjs
+      - run: node scripts/build-catalog.mjs --check
 
       - name: Build import artifact
         run: |
           node scripts/build-import.mjs --out dist/import-base64.txt
           node scripts/validate.mjs --import dist/import-base64.txt
           (cd dist && sha256sum import-base64.txt > import-base64.txt.sha256)
+
+      - name: Verify the catalog at this tag (public repositories only)
+        if: ${{ !github.event.repository.private }}
+        run: node scripts/check-catalog.mjs --base-url "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}"
 
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
@@ -32,7 +37,12 @@ jobs:
             dist/import-base64.txt.sha256
           generate_release_notes: true
           body: |
-            `import-base64.txt` is the generic Dokploy import (domains are generated as
-            `*.sslip.io` by Dokploy). For your own domain, build it locally:
+            **Install from Dokploy's Templates catalog:** Create Service → Template →
+            Base URL `https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}`
+            → search "Headscale".
+
+            **Or import:** `import-base64.txt` is the generic Dokploy import (domains are
+            generated as `*.sslip.io`); for your own domain run
             `npm ci && npm run build:import -- --base-domain example.com`.
-            See the README for DNS, HTTPS and first-login steps.
+
+            See the README for DNS, HTTPS, the SSH-free first login and upgrades.

@@ -1,4 +1,48 @@
 services:
+  # Renders /etc/headscale/config.yaml and /etc/headplane/config.yaml from the
+  # Dokploy mount templates and the Environment tab, on every deploy. Runs
+  # once and exits; nothing else starts until it has succeeded.
+  headscale-config:
+    image: docker.io/headscale/headscale:0.29.5-debug
+    restart: "no"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      HEADSCALE_HOST: ${HEADSCALE_HOST:?set HEADSCALE_HOST in the Environment tab}
+      HEADPLANE_HOST: ${HEADPLANE_HOST:?set HEADPLANE_HOST in the Environment tab}
+      MAGICDNS_DOMAIN: ${MAGICDNS_DOMAIN:?set MAGICDNS_DOMAIN in the Environment tab}
+      HEADPLANE_COOKIE_SECRET: ${HEADPLANE_COOKIE_SECRET:?set HEADPLANE_COOKIE_SECRET in the Environment tab}
+    entrypoint: ["sh", "-ec"]
+    command:
+      - |
+        umask 077
+        dns='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?([.][a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$$'
+        check() {
+          printf '%s' "$$2" | grep -Eqx "$$3" || { echo "error: $$1 is invalid ($$4)" >&2; exit 1; }
+        }
+        check HEADSCALE_HOST "$$HEADSCALE_HOST" "$$dns" "expected a lowercase DNS name"
+        check HEADPLANE_HOST "$$HEADPLANE_HOST" "$$dns" "expected a lowercase DNS name"
+        check MAGICDNS_DOMAIN "$$MAGICDNS_DOMAIN" "$$dns" "expected a lowercase DNS name"
+        check HEADPLANE_COOKIE_SECRET "$$HEADPLANE_COOKIE_SECRET" '[A-Za-z0-9]{32}' "expected 32 letters or digits"
+        render() {
+          sed -e "s/{{HEADSCALE_HOST}}/$$HEADSCALE_HOST/g" \
+              -e "s/{{HEADPLANE_HOST}}/$$HEADPLANE_HOST/g" \
+              -e "s/{{MAGICDNS_DOMAIN}}/$$MAGICDNS_DOMAIN/g" \
+              -e "s/{{HEADPLANE_COOKIE_SECRET}}/$$HEADPLANE_COOKIE_SECRET/g" "$$1" >"$$2.tmp"
+          if grep -q '{{' "$$2.tmp"; then echo "error: unknown placeholder in $$1" >&2; exit 1; fi
+          mv "$$2.tmp" "$$2"
+        }
+        render /templates/headscale.yaml /out/headscale/config.yaml
+        render /templates/headplane.yaml /out/headplane/config.yaml
+        echo "configuration rendered for https://$$HEADSCALE_HOST and https://$$HEADPLANE_HOST"
+    volumes:
+      - ../files/templates:/templates:ro
+      - headscale-config:/out/headscale
+      - headplane-config:/out/headplane
+
   headscale:
     image: docker.io/headscale/headscale:0.29.5
     command: serve
@@ -8,12 +52,18 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    depends_on:
+      # restart: re-read the configuration whenever headscale-config is
+      # recreated, i.e. after any change in the Environment tab.
+      headscale-config:
+        condition: service_completed_successfully
+        restart: true
     expose:
       - "8080"
     volumes:
       - headscale-data:/var/lib/headscale
       - headscale-socket:/var/run/headscale
-      - ../files/etc/headscale/config.yaml:/etc/headscale/config.yaml:ro
+      - headscale-config:/etc/headscale:ro
     healthcheck:
       test: ["CMD", "headscale", "health"]
       interval: 30s
@@ -32,20 +82,67 @@ services:
     tmpfs:
       - /tmp
     depends_on:
+      headscale-config:
+        condition: service_completed_successfully
+        restart: true
       headscale:
         condition: service_healthy
     expose:
       - "3000"
     volumes:
       - headplane-data:/var/lib/headplane
-      - ../files/etc/headplane/config.yaml:/etc/headplane/config.yaml:ro
-      - ../files/etc/headscale/config.yaml:/etc/headscale/config.yaml:ro
+      - headplane-config:/etc/headplane:ro
+      - headscale-config:/etc/headscale:ro
     healthcheck:
       test: ["CMD", "/bin/hp_healthcheck"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 20s
+    # Routing in front of Headplane, all answered by Traefik without reaching
+    # it (Dokploy's own router for the headplane domain covers /admin/ only):
+    #   GET/HEAD / and /admin           -> 302 /admin/ (query string kept)
+    #   other paths outside /admin/     -> 404 (no router matches)
+    #   /admin/... with a method the UI never sends (it uses GET, HEAD, POST
+    #   and PATCH)                       -> 405
+    #   /admin/... dot-files and .php/.asp(x)/.jsp/.cgi probes -> 404
+    # The 404/405 replies come from Traefik's noop@internal service (418)
+    # rewritten by an errors middleware. Names are prefixed with the Dokploy app
+    # name and never reference Dokploy's generated routers; Dokploy adds
+    # traefik.enable and the network label because the service has a domain.
+    labels:
+      - traefik.http.routers.${APP_NAME}-headplane-root.rule=Host(`${HEADPLANE_HOST}`) && (Path(`/`) || Path(`/admin`)) && (Method(`GET`) || Method(`HEAD`))
+      - traefik.http.routers.${APP_NAME}-headplane-root.entrypoints=websecure
+      - traefik.http.routers.${APP_NAME}-headplane-root.tls=true
+      - traefik.http.routers.${APP_NAME}-headplane-root.service=noop@internal
+      - traefik.http.routers.${APP_NAME}-headplane-root.middlewares=${APP_NAME}-headplane-root
+      - traefik.http.routers.${APP_NAME}-headplane-root-http.rule=Host(`${HEADPLANE_HOST}`) && (Path(`/`) || Path(`/admin`)) && (Method(`GET`) || Method(`HEAD`))
+      - traefik.http.routers.${APP_NAME}-headplane-root-http.entrypoints=web
+      - traefik.http.routers.${APP_NAME}-headplane-root-http.service=noop@internal
+      - traefik.http.routers.${APP_NAME}-headplane-root-http.middlewares=${APP_NAME}-headplane-root
+      - traefik.http.middlewares.${APP_NAME}-headplane-root.redirectregex.regex=^https?://[^/]+(/admin)?/?(\?.*)?$$
+      - traefik.http.middlewares.${APP_NAME}-headplane-root.redirectregex.replacement=https://${HEADPLANE_HOST}/admin/$${2}
+      - traefik.http.middlewares.${APP_NAME}-headplane-root.redirectregex.permanent=false
+      - traefik.http.routers.${APP_NAME}-headplane-methods.rule=Host(`${HEADPLANE_HOST}`) && PathPrefix(`/admin`) && !Method(`GET`) && !Method(`HEAD`) && !Method(`POST`) && !Method(`PATCH`)
+      - traefik.http.routers.${APP_NAME}-headplane-methods.priority=1000
+      - traefik.http.routers.${APP_NAME}-headplane-methods.entrypoints=websecure
+      - traefik.http.routers.${APP_NAME}-headplane-methods.tls=true
+      - traefik.http.routers.${APP_NAME}-headplane-methods.service=noop@internal
+      - traefik.http.routers.${APP_NAME}-headplane-methods.middlewares=${APP_NAME}-headplane-405
+      - traefik.http.routers.${APP_NAME}-headplane-probes.rule=Host(`${HEADPLANE_HOST}`) && (PathRegexp(`^/admin/(.*/)?\.`) || PathRegexp(`^/admin/.*\.(php|aspx?|jsp|cgi)$$`))
+      - traefik.http.routers.${APP_NAME}-headplane-probes.priority=1000
+      - traefik.http.routers.${APP_NAME}-headplane-probes.entrypoints=websecure
+      - traefik.http.routers.${APP_NAME}-headplane-probes.tls=true
+      - traefik.http.routers.${APP_NAME}-headplane-probes.service=noop@internal
+      - traefik.http.routers.${APP_NAME}-headplane-probes.middlewares=${APP_NAME}-headplane-404
+      - traefik.http.middlewares.${APP_NAME}-headplane-404.errors.status=418
+      - traefik.http.middlewares.${APP_NAME}-headplane-404.errors.service=noop@internal
+      - traefik.http.middlewares.${APP_NAME}-headplane-404.errors.query=/
+      - traefik.http.middlewares.${APP_NAME}-headplane-404.errors.statusRewrites.418=404
+      - traefik.http.middlewares.${APP_NAME}-headplane-405.errors.status=418
+      - traefik.http.middlewares.${APP_NAME}-headplane-405.errors.service=noop@internal
+      - traefik.http.middlewares.${APP_NAME}-headplane-405.errors.query=/
+      - traefik.http.middlewares.${APP_NAME}-headplane-405.errors.statusRewrites.418=405
 
   # Optional admin shell for creating API keys from Dokploy's web terminal
   # (Containers -> headscale-admin -> Terminal -> /bin/sh). The official
@@ -71,7 +168,7 @@ services:
         condition: service_healthy
     volumes:
       - headscale-socket:/var/run/headscale
-      - ../files/etc/headscale/config.yaml:/etc/headscale/config.yaml:ro
+      - headscale-config:/etc/headscale:ro
     # "healthy" means the CLI can reach the server through the socket.
     healthcheck:
       test: ["CMD", "headscale", "health"]
@@ -83,6 +180,9 @@ services:
 volumes:
   headscale-data: {}
   headplane-data: {}
+  # Rendered configuration (re-created by headscale-config on every deploy).
+  headscale-config: {}
+  headplane-config: {}
   # Headscale's admin socket, shared only with headscale-admin. Backed by
   # tmpfs so it never persists on disk.
   headscale-socket:
