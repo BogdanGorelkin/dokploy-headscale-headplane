@@ -33,6 +33,7 @@ After a deployment you have:
 - [DNS](#dns)
 - [HTTPS](#https)
 - [First login without SSH](#first-login-without-ssh)
+  ([signed out? new API key](#signed-out-get-a-new-api-key))
 - [How Headplane is routed](#how-headplane-is-routed)
 - [Connecting Tailscale clients](#connecting-tailscale-clients)
 - [Pre-authentication keys](#pre-authentication-keys)
@@ -277,6 +278,35 @@ How the helper is contained:
 `./scripts/create-api-key.sh` lists Headscale deployments, and
 `./scripts/create-api-key.sh <app-name> 90d` creates a key.
 
+### Signed out? Get a new API key
+
+Headplane asks for an API key again when the session ends. That happens after at most 24 hours
+(`cookie_max_age`), when the key you signed in with expires, or after a re-import (new cookie
+secret). Nothing is lost; create a fresh key the same way as the first one:
+
+1. Dokploy → the Compose service → **Containers** → `headscale-admin`. If it is *exited*:
+   **⋯ → Start**.
+2. **⋯ → Terminal → /bin/sh** tab.
+3. Run:
+
+   ```sh
+   headscale apikeys create --expiration 90d
+   ```
+
+4. Paste the `hskey-api-…` value at `https://<HEADPLANE_HOST>/admin/`.
+
+Keys you no longer need: `headscale apikeys list`, then
+`headscale apikeys expire --prefix <prefix>` in the same terminal.
+
+Deployments without `headscale-admin` (made with an older template version, or by hand): over
+SSH on the Docker host, run `./scripts/create-api-key.sh <app-name> 90d`, or directly:
+
+```bash
+docker exec "$(docker ps -q -f label=com.docker.compose.project=<app-name> \
+                            -f label=com.docker.compose.service=headscale)" \
+  headscale apikeys create --expiration 90d
+```
+
 ## How Headplane is routed
 
 Headplane serves everything under `/admin/`; its server answers every other path with a React
@@ -390,6 +420,7 @@ this upgrade, from `5bca341`.
 | Symptom | Cause and fix |
 | --- | --- |
 | Deploy fails: `service "headscale-config" didn't complete successfully` | An Environment value is invalid. Check **Containers → headscale-config → Logs**, fix it, redeploy |
+| Headplane asks for an API key again | Session ended (24 h, key expiry or re-import): [create a new key](#signed-out-get-a-new-api-key) |
 | Headplane login returns to the login page | Headplane isn't served over valid HTTPS (Secure cookie). Set Let's Encrypt on the domain and redeploy |
 | Browser shows "TRAEFIK DEFAULT CERT" | Certificate not issued yet: check DNS, port 80, *Certificate Provider* |
 | `tailscale up` hangs or reports TLS errors | Same as above, or the Headscale record is proxied by Cloudflare |
